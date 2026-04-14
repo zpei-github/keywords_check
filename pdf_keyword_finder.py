@@ -16,7 +16,6 @@ PDF关键字搜索工具
 
 import fitz  # PyMuPDF
 import re
-import random
 import bisect
 from typing import List, Dict, Tuple
 from openpyxl import Workbook
@@ -32,73 +31,8 @@ BOUNDARY_CHARS = set('。！？!?')
 IGNOR_CHARS = set('(（注')
 
 
-def auto_detect_noise_blocks(doc, check_num: int) -> Tuple[int, int]:
-    """
-    自动检测页眉页脚等噪音block数量
-
-    检测逻辑：
-    - blocks顺序通常是：正文 -> 页眉页脚 -> 页码/水印（末尾）
-    - 开头相同的block判定为页眉（如果页眉出现在blocks开头）
-    - 末尾相同的block判定为页脚/水印
-    - 最后一个block通常是页码，每页不同，默认跳过1个
-
-    参数:
-        doc: fitz.Document对象
-        check_num: 检测的页面数量
-
-    返回:
-        (skip_start_block, skip_end_block) 需要跳过的开头和末尾block数量
-    """
-    skip_start_block = 0
-    skip_end_block = 0  # 默认跳过最后一个block（通常是页码）
-
-    if len(doc) <= 2 * check_num:
-        return skip_start_block, skip_end_block
-
-    # 从中间随机选几页进行比对，避免封面等特殊情况
-    random_list = random.sample(range(check_num, len(doc)), check_num)
-    page_blocks = [doc[page_num].get_text_blocks() for page_num in random_list]
-
-    # 检测开头的噪音block（页眉）
-    # 如果多个页面开头的block文本相同，则为噪音
-    while True:
-        texts = set()
-        valid = True
-        for blocks in page_blocks:
-            if len(blocks) <= skip_start_block:
-                valid = False
-                break
-            texts.add(blocks[skip_start_block][4])
-
-        if not valid or len(texts) > 1:
-            break
-        skip_start_block += 1
-
-    # 检测末尾的噪音block（页脚/水印）
-    # 先跳过最后一个（页码），然后检查倒数第二个、第三个...
-    while True:
-        texts = set()
-        valid = True
-        for blocks in page_blocks:
-            idx = -(skip_end_block + 1)  # 倒数第(skip_end_block+1)个
-            if len(blocks) <= skip_end_block + 1:
-                valid = False
-                break
-            texts.add(blocks[idx][4])
-
-        if not valid or len(texts) > 1:
-            break
-        skip_end_block += 1
-
-    return skip_start_block, skip_end_block
-
-
 def get_page_text_with_layout(
-    pdf_path: str,
-    check_num: int,
-    skip_start_block: int = 0,
-    skip_end_block: int = 0,
-    auto_clean_noise: bool = True
+    pdf_path: str
 ) -> Tuple[str, List[Dict]]:
     """
     获取PDF文本，将每个block去除换行符后拼接
@@ -120,21 +54,11 @@ def get_page_text_with_layout(
     block_info = []  # 记录每个block的信息
     current_pos = 0  # 当前文本位置
 
-    # 自动检测噪音block
-    if auto_clean_noise:
-        auto_skip_start, auto_skip_end = auto_detect_noise_blocks(doc, check_num)
-        skip_start_block = max(skip_start_block, auto_skip_start)
-        skip_end_block = max(skip_end_block, auto_skip_end)
-        print(f"自动检测: 跳过开头 {skip_start_block} 个block, 跳过末尾 {skip_end_block} 个block")
 
     for page_num in range(len(doc)):
         page = doc[page_num]
         blocks = page.get_text_blocks()
         # 去除页面的页眉页脚和页码等噪音
-        if skip_end_block > 0:
-            blocks = blocks[skip_start_block: len(blocks) - skip_end_block]
-        else:
-            blocks = blocks[skip_start_block:]
         for block in blocks:
             x0, y0, x1, y1, text, block_no, block_type = block
 
@@ -161,7 +85,8 @@ def get_page_text_with_layout(
 def find_keywords_in_text(
     full_text: str,
     keywords: List[str],
-    context_chars: int
+    context_chars: int,
+    front_window: int
 ) -> List[Dict]:
     """
     在文本中搜索关键字，返回完整句子（去重后）
@@ -193,17 +118,18 @@ def find_keywords_in_text(
     if not all_matches:
         return []
 
-    # 按位置排序
-    all_matches.sort(key=lambda x: x['start'])
-
     # 提取句子并根据范围重叠进行合并
     sentence_list = []
 
     for match in all_matches:
-        print(match)
         sentence, sentence_start, sentence_end = extract_sentence_from_text(
-            full_text, match['start'], match['end'], context_chars
+            text = full_text, 
+            start_pos = match['start'], 
+            end_pos = match['end'], 
+            context_chars = context_chars,
+            front_window= front_window
         )
+        
         sentence_list.append({
             'sentence': sentence,
             'keywords': {match['keyword']},
@@ -212,8 +138,8 @@ def find_keywords_in_text(
             'position': match['start']
         })
 
-    # 按句子开始位置排序
-    sentence_list.sort(key=lambda x: x['sentence_start'])
+    # 按句子开始位置, 句子结束位置分别进行排序
+    sentence_list.sort(key=lambda x: (x['sentence_start'], x['sentence_end']))
 
     # 合并重叠的句子
     merged = []
@@ -221,49 +147,45 @@ def find_keywords_in_text(
         if not merged:
             merged.append(item)
             continue
-
         last = merged[-1]
-        if item['sentence_end'] <= last['sentence_end']:
-            last['sentence'] = WHITESPACE_PATTERN.sub(' ', last['sentence'])
-            last['keywords'].update(item['keywords'])
-        elif item['sentence_start'] == last['sentence_start']:
+        if item['sentence_end'] >= last['sentence_end'] and item['sentence_start'] == last['sentence_start']:
             item['keywords'].update(last['keywords'])
             item['sentence'] = WHITESPACE_PATTERN.sub(' ', item['sentence'])
             merged[-1] = item
         else:
             merged.append(item)
-
-
     return merged
 
 
-def extract_sentence_from_text(text: str, start_pos: int, end_pos: int, context_chars: int) -> Tuple[str, int, int]:
+def extract_sentence_from_text(text: str, start_pos: int, end_pos: int, context_chars: int, front_window:int) -> Tuple[str, int, int]:
     """从文本中提取包含关键字的完整句子"""
     text_len = len(text)
 
     # 向前找句子开始
     sentence_start = start_pos
     min_bound = max(0, start_pos - context_chars)  # 向前边界
+    if start_pos - front_window <=0:
+        sentence_start = 0
+    else:
+        for i in range(start_pos - front_window, -1, -1):
+            current_char = text[i]
+            # 边界检查：下一字符是否存在
+            next_char = text[i + 1] if i + 1 < text_len else ''
 
-    for i in range(start_pos - 1, -1, -1):
-        current_char = text[i]
-        # 边界检查：下一字符是否存在
-        next_char = text[i + 1] if i + 1 < text_len else ''
+            # 在 context_chars 范围内：只检测 BOUNDARY_CHARS
+            # 突破边界后：同时检测 BOUNDARY_CHARS 和 EXTRA_BOUNDARY_CHARS
+            if i >= min_bound:
+                # 范围内：遇到句末标点且下一字符不在 IGNOR_CHARS 中才截断
+                if current_char in BOUNDARY_CHARS and next_char not in IGNOR_CHARS:
+                    sentence_start = i + 1
+                    break
+            else:
+                # 突破边界：遇到任何分界符都截断
+                if current_char in BOUNDARY_CHARS or current_char in EXTRA_BOUNDARY_CHARS:
+                    sentence_start = i + 1
+                    break
 
-        # 在 context_chars 范围内：只检测 BOUNDARY_CHARS
-        # 突破边界后：同时检测 BOUNDARY_CHARS 和 EXTRA_BOUNDARY_CHARS
-        if i >= min_bound:
-            # 范围内：遇到句末标点且下一字符不在 IGNOR_CHARS 中才截断
-            if current_char in BOUNDARY_CHARS and next_char not in IGNOR_CHARS:
-                sentence_start = i + 1
-                break
-        else:
-            # 突破边界：遇到任何分界符都截断
-            if current_char in BOUNDARY_CHARS or current_char in EXTRA_BOUNDARY_CHARS:
-                sentence_start = i + 1
-                break
-
-        sentence_start = i
+            sentence_start = i
 
     # 向后找句子结束
     sentence_end = end_pos
@@ -294,8 +216,8 @@ def extract_sentence_from_text(text: str, start_pos: int, end_pos: int, context_
 
 def find_keywords_in_pdf(
     pdf_path: str,
-    context_width: int,
-    auto_check_num: int,
+    context_rich: int,
+    front_window: int,
     keywords: List[str] | Dict[str, int],
     output_file: str | None = None,
     excel_file: str | None = None
@@ -321,12 +243,12 @@ def find_keywords_in_pdf(
         keywords_point = {k: 1 for k in keywords_list}
 
     # 获取拼接后的文本
-    full_text, block_info = get_page_text_with_layout(pdf_path, check_num=auto_check_num, auto_clean_noise=True)
+    full_text, block_info = get_page_text_with_layout(pdf_path)
     print(f"文本总长度: {len(full_text)} 字符, 共 {len(block_info)} 个文本块")
 
     # 搜索关键字
     print(f"正在搜索关键字: {keywords_list}")
-    results = find_keywords_in_text(full_text, keywords_list, context_width)
+    results = find_keywords_in_text(full_text, keywords_list, context_rich, front_window)
 
     print(f"\n找到 {len(results)} 处匹配")
 
@@ -503,7 +425,7 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
 # 使用示例
 if __name__ == "__main__":
     # 示例：搜索单个PDF文件
-    pdf_path = r"E:\Desktop\test.pdf"  # 替换为你的PDF文件路径
+    pdf_path = r"E:\Desktop\0423投标-振华群英网络改造项目\（招标文件）0730-2611GZ011901；网络改造项目（售卖稿）.pdf"  # 替换为你的PDF文件路径
 
     # 定义要搜索的关键字及分数
     keywords_point = {
@@ -530,8 +452,8 @@ if __name__ == "__main__":
     results = find_keywords_in_pdf(
         pdf_path=pdf_path,
         keywords=keywords_point,
-        context_width=200,
-        auto_check_num=3,
+        context_rich=100,
+        front_window= 0,
         output_file=r"E:\Desktop\output.txt",  # 可选：保存txt结果
         excel_file=r"E:\Desktop\output.xlsx"   # 可选：保存Excel结果（按重要性排序）
     )

@@ -21,7 +21,7 @@ class PDFKeywordFinderApp(ctk.CTk):
         super().__init__()
 
         # 窗口基本设置
-        self.title("PDF关键字搜索工具")
+        self.title("解决方案中心工具")
         self.geometry("950x750")
         self.minsize(850, 650)
 
@@ -33,8 +33,7 @@ class PDFKeywordFinderApp(ctk.CTk):
         self.pdf_path = ctk.StringVar()
         self.output_dir = ctk.StringVar()
         self.context_chars = ctk.IntVar(value=200)
-        self.auto_clean_noise = ctk.BooleanVar(value=True)
-        self.check_num = ctk.IntVar(value=3)
+        self.front_window = ctk.IntVar(value=0)
         self.output_txt = ctk.BooleanVar(value=True)
         self.output_excel = ctk.BooleanVar(value=True)
         self.sort_by_importance = ctk.BooleanVar(value=True)
@@ -91,7 +90,7 @@ class PDFKeywordFinderApp(ctk.CTk):
         # 2. 标题
         title_label = ctk.CTkLabel(
             self.main_frame,
-            text="📄 解决方案中心PDF关键字搜索工具",
+            text="📄 解决方案中心PDF标书分析工具",
             font=ctk.CTkFont(size=20, weight="bold")
         )
         title_label.pack(fill="x", pady=(0, 15))
@@ -205,7 +204,7 @@ class PDFKeywordFinderApp(ctk.CTk):
         search_frame.pack(fill="x", padx=15, pady=5)
 
         # 上下文字符数
-        context_label = ctk.CTkLabel(search_frame, text="上下文字符数:", anchor="w")
+        context_label = ctk.CTkLabel(search_frame, text="上下文丰富度:", anchor="w")
         context_label.pack(fill="x")
         context_frame = ctk.CTkFrame(search_frame, fg_color="transparent")
         context_frame.pack(fill="x", pady=(0, 10))
@@ -221,17 +220,19 @@ class PDFKeywordFinderApp(ctk.CTk):
         context_value = ctk.CTkLabel(context_frame, textvariable=self.context_chars, width=40)
         context_value.pack(side="left", padx=(10, 0))
 
-        # 自动清理页眉页脚
-        self.clean_check = ctk.CTkCheckBox(search_frame, text="自动清理页眉页脚", variable=self.auto_clean_noise)
-        self.clean_check.pack(fill="x", pady=5)
+        # 固定窗口字数
+        front_frame = ctk.CTkFrame(search_frame, fg_color="transparent")
+        front_frame.pack(fill="x", pady=(0, 10))
+        front_label = ctk.CTkLabel(front_frame, text="前窗口字数:", width=80, anchor="w")
+        front_label.pack(side="left")
 
-        # 检测页数
-        check_frame = ctk.CTkFrame(search_frame, fg_color="transparent")
-        check_frame.pack(fill="x", pady=5)
-
-        ctk.CTkLabel(check_frame, text="检测页数:").pack(side="left")
-        self.check_entry = ctk.CTkEntry(check_frame, textvariable=self.check_num, width=50)
-        self.check_entry.pack(side="left", padx=(10, 0))
+        self.front_entry = ctk.CTkEntry(
+            front_frame,
+            textvariable=self.front_window,
+            width=50,
+            placeholder_text="默认 0"
+            )
+        self.front_entry.pack(side="left", fill="x",  padx=(10, 0))
 
         # 分隔线
         separator = ctk.CTkFrame(settings_frame, height=2, fg_color="gray50")
@@ -308,8 +309,7 @@ class PDFKeywordFinderApp(ctk.CTk):
         self.clear_btn.configure(state=state)
         self.open_dir_btn.configure(state=state)
         self.context_slider.configure(state=state)
-        self.check_entry.configure(state=state)
-        self.clean_check.configure(state=state)
+        self.front_entry.configure(state=state)  # 同步禁用输入框
         self.txt_check.configure(state=state)
         self.excel_check.configure(state=state)
         self.sort_check.configure(state=state)
@@ -439,8 +439,7 @@ class PDFKeywordFinderApp(ctk.CTk):
                 "keywords": self.keywords,
                 "settings": {
                     "context_chars": self.context_chars.get(),
-                    "auto_clean_noise": self.auto_clean_noise.get(),
-                    "check_num": self.check_num.get(),
+                    "front_window": self.front_window.get(),
                     "output_txt": self.output_txt.get(),
                     "output_excel": self.output_excel.get(),
                     "sort_by_importance": self.sort_by_importance.get()
@@ -473,8 +472,7 @@ class PDFKeywordFinderApp(ctk.CTk):
                 if "settings" in config and isinstance(config["settings"], dict):
                     settings = config["settings"]
                     if "context_chars" in settings: self.context_chars.set(settings["context_chars"])
-                    if "auto_clean_noise" in settings: self.auto_clean_noise.set(settings["auto_clean_noise"])
-                    if "check_num" in settings: self.check_num.set(settings["check_num"])
+                    if "front_window" in settings: self.front_window.set(settings["front_window"])
                     if "output_txt" in settings: self.output_txt.set(settings["output_txt"])
                     if "output_excel" in settings: self.output_excel.set(settings["output_excel"])
                     if "sort_by_importance" in settings: self.sort_by_importance.set(settings["sort_by_importance"])
@@ -535,7 +533,7 @@ class PDFKeywordFinderApp(ctk.CTk):
             args=(
                 self.pdf_path.get(),
                 self.context_chars.get(),
-                self.check_num.get(),
+                self.front_window.get(),
                 self.keywords.copy(),
                 output_file,
                 excel_file,
@@ -548,17 +546,17 @@ class PDFKeywordFinderApp(ctk.CTk):
         # 定时检查搜索状态
         self.after(100, self._check_search_status)
 
-    def _search_thread(self, pdf_path: str, context_width:int, check_num:int,keywords: Dict[str, int], output_file: Optional[str], excel_file: Optional[str], output_dir: str):
+    def _search_thread(self, pdf_path: str, context_rich:int, front_window : int, keywords: Dict[str, int], output_file: Optional[str], excel_file: Optional[str], output_dir: str):
         """搜索线程"""
         try:
             # 调用搜索函数
             results = pdf_keyword_finder.find_keywords_in_pdf(
                 pdf_path=pdf_path,
                 keywords=keywords,
-                context_width=context_width,
-                auto_check_num = check_num,
+                context_rich=context_rich,
+                front_window = front_window,
                 output_file=output_file,
-                excel_file=excel_file
+                excel_file=excel_file,
             )
 
             self._search_success = True
