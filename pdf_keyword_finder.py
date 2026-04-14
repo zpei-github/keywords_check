@@ -66,16 +66,16 @@ def detect_noise_blocks(
     """
     if not all_blocks:
         return set(), []
-    print(all_blocks)
     total_pages = len(set(b['page'] for b in all_blocks))
     if total_pages == 0:
         return set(), []
-
     # 构建关键字正则模式（用于保护包含关键字的内容）
     keyword_pattern = None
     if keywords:
         escaped_keywords = [re.escape(kw) for kw in keywords]
         keyword_pattern = re.compile('|'.join(escaped_keywords), re.IGNORECASE)
+    else:
+        return  set(), {}
 
     # 收集每个页面的高度信息
     page_heights = {}
@@ -101,7 +101,6 @@ def detect_noise_blocks(
     for text, pages in text_occurrences.items():
         repeat_rate = len(pages) / total_pages
         if repeat_rate >= repeat_threshold:
-            print(text)
             repeated_texts.add(text)
 
     # 判断哪些block应该被过滤
@@ -121,18 +120,6 @@ def detect_noise_blocks(
         is_at_edge = (y0 < page_height * header_ratio) or (y1 > page_height * footer_ratio)
         is_repeated = text in repeated_texts
 
-        # 规则2：包含数字的文本且在边缘位置（可能是页码、页眉页脚中的页码）
-        if re.search(r'\d', text) and is_at_edge:
-            noise_indices.add(idx)
-            noise_info.append({
-                'page': block['page'],
-                'block_no': block['block_no'],
-                'text': text,
-                'repeat_rate': 1.0,
-                'reason': '边缘位置+带有数字'
-            })
-            continue
-
         # 规则3：位置 + 重复率判断
         if is_at_edge and is_repeated:
             noise_indices.add(idx)
@@ -141,8 +128,22 @@ def detect_noise_blocks(
                 'block_no': block['block_no'],
                 'text': text[:50] + '...' if len(text) > 50 else text,
                 'repeat_rate': len(text_occurrences.get(text, set())) / total_pages,
-                'reason': '边缘位置+高频重复'
+                'reason': '边缘位置+高频重复',
+                'position': '页眉' if y0 < page_height * header_ratio else '页脚'
             })
+        
+        # 规则2：包含数字的文本且在边缘位置（可能是页码、页眉页脚中的页码）
+        if re.search(r'\d', text) and is_at_edge and len(text):
+            noise_indices.add(idx)
+            noise_info.append({
+                'page': block['page'],
+                'block_no': block['block_no'],
+                'text': text,
+                'repeat_rate': 0,
+                'reason': '边缘位置+带有数字',
+                'position': '页眉' if y0 < page_height * header_ratio else '页脚'
+            })
+            continue
 
     # 打印检测到的噪声信息
     if noise_info:
@@ -221,7 +222,6 @@ def get_page_text_with_layout(
     noise_indices = set()
     noise_info = []
     if auto_clean_noise:
-        print("正在自动检测页眉页脚和水印...")
         # 限制检测的页面数量以提高性能
         blocks_to_check = raw_blocks
         if check_pages and check_pages < len(doc):
@@ -665,7 +665,7 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
 # 使用示例
 if __name__ == "__main__":
     # 示例：搜索单个PDF文件
-    pdf_path = r"E:\Desktop\0423投标-振华群英网络改造项目\（招标文件）0730-2611GZ011901；网络改造项目（售卖稿）.pdf"  # 替换为你的PDF文件路径
+    pdf_path = r"E:\Desktop\招标文件-副本.pdf"  # 替换为你的PDF文件路径
 
     # 定义要搜索的关键字及分数
     keywords_point = {
@@ -703,6 +703,6 @@ if __name__ == "__main__":
         #==================噪声检测配置==================
         auto_clean_noise=True,  # 开启自动检测页眉页脚和水印
         header_ratio=0.15,      # 页眉区域占比
-        footer_ratio=0.85,      # 页脚区域占比
+        footer_ratio=0.9,      # 页脚区域占比
         repeat_threshold=0.8    # 重复率阈值
     )

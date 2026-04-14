@@ -76,12 +76,27 @@ class NoiseResultDialog(QDialog):
                     'text': text,
                     'reason': item.get('reason', ''),
                     'pages': set(),
-                    'repeat_rate': item.get('repeat_rate', 0)
+                    'repeat_rate': item.get('repeat_rate', 0),
+                    'position': item.get('position', '')
                 }
             noise_aggregation[text]['pages'].add(item.get('page', ''))
 
         unique_noise_list = list(noise_aggregation.values())
-        unique_noise_list.sort(key=lambda x: x.get('repeat_rate', 0), reverse=True)
+
+        # 按类型和重复率排序：先'边缘位置+高频重复'，后'边缘位置+带有数字'
+        def sort_key(item):
+            reason = item.get('reason', '')
+            repeat_rate = item.get('repeat_rate', 0)
+            # 排序优先级：高频重复=0，数字=1，其他=2
+            if '高频重复' in reason:
+                priority = 0
+            elif '数字' in reason:
+                priority = 1
+            else:
+                priority = 2
+            return (priority, -repeat_rate)  # 负号表示降序
+
+        unique_noise_list.sort(key=sort_key)
 
         reason_count = {}
         for item in unique_noise_list:
@@ -90,15 +105,24 @@ class NoiseResultDialog(QDialog):
 
         total_unique = len(unique_noise_list)
         total_blocks = len(noise_info)
+
+        # 按排序顺序显示统计
         summary = f"共检测到 {total_blocks} 个噪声block，去重后 {total_unique} 种\n\n按类型统计:\n"
+        # 按优先级显示
+        reason_order = ['边缘位置+高频重复', '边缘位置+带有数字']
+        for reason in reason_order:
+            if reason in reason_count:
+                summary += f"  • {reason}: {reason_count[reason]}种\n"
+        # 显示其他类型
         for reason, count in reason_count.items():
-            summary += f"  • {reason}: {count}种\n"
+            if reason not in reason_order:
+                summary += f"  • {reason}: {count}种\n"
 
         summary_label = QLabel(summary)
         summary_label.setWordWrap(True)
         layout.addWidget(summary_label)
 
-        detail_label = QLabel("去重后的噪声详情（按重复率排序，前10条）:")
+        detail_label = QLabel("去重后的噪声详情（按类型排序，类型内按重复率降序）:")
         detail_label.setFont(QFont("", -1, QFont.Bold))
         layout.addWidget(detail_label)
 
@@ -107,18 +131,24 @@ class NoiseResultDialog(QDialog):
         text_browser.setOpenExternalLinks(False)
         details = []
 
-        for item in unique_noise_list[:10]:
-            text = item.get('text', '')
+        # 追踪当前类型，添加分组标题
+        current_reason = None
+        for item in unique_noise_list[:15]:
             reason = item.get('reason', '未知')
             repeat_rate = item.get('repeat_rate', 0)
             pages = item.get('pages', set())
-            # 截断过长的文本
+            text = item.get('text', '')
             display_text = text[:50] + '...' if len(text) > 50 else text
-            # 格式化显示
-            details.append(f"• {reason} | 重复率:{repeat_rate:.1%} | 页数:{len(pages)}页 | 内容: {display_text}")
 
-        if len(unique_noise_list) > 10:
-            details.append(f"\n... 还有 {len(unique_noise_list) - 10} 种噪声未显示")
+            # 类型变化时添加分组标题
+            if current_reason != reason:
+                details.append(f"\n【{reason}】")
+                current_reason = reason
+
+            details.append(f"  • 重复率:{repeat_rate:.1%} | 页数:{len(pages)}页 | 内容: {display_text}")
+
+        if len(unique_noise_list) > 15:
+            details.append(f"\n... 还有 {len(unique_noise_list) - 15} 种噪声未显示")
 
         text_browser.setText("\n".join(details))
         layout.addWidget(text_browser)
@@ -147,21 +177,34 @@ class NoiseResultDialog(QDialog):
         text_browser.setOpenExternalLinks(False)
         details = []
 
-        for idx, item in enumerate(unique_noise_list, 1):
+        # 按分组显示
+        current_reason = None
+        group_idx = 0
+        for item in unique_noise_list:
             text = item.get('text', '')
             reason = item.get('reason', '未知')
             repeat_rate = item.get('repeat_rate', 0)
             pages = item.get('pages', set())
             pages_str = ', '.join(sorted(str(p) for p in pages)) if pages else 'N/A'
-            details.append(f"{idx}. {reason} | 重复率:{repeat_rate:.1%} | 出现页码: {pages_str}\n   内容: {text}")
+            position = item.get('position')
+            # 类型变化时添加分组标题
+            if current_reason != reason:
+                if current_reason is not None:
+                    details.append("")
+                details.append(f"【{reason}】")
+                current_reason = reason
+                group_idx = 1  # 组内序号
 
-        text_browser.setText("\n\n".join(details))
+            details.append(f"  {group_idx}. 重复率:{repeat_rate:.1%} | 位置:{position} | 页码: {pages_str}\n     内容: {text}")
+            group_idx += 1
+
+        text_browser.setText("\n".join(details))
         layout.addWidget(text_browser)
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(dialog.accept)
+        close_btn.clicked.connect(dialog.close)
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
 
@@ -371,8 +414,8 @@ class PDFKeywordFinderApp(QMainWindow):
         noise_layout.addWidget(QLabel("页眉区域 (%):"))
         h_layout = QHBoxLayout()
         self.header_slider = QSlider(Qt.Horizontal)
-        self.header_slider.setRange(5, 30)
-        self.header_slider.setValue(15)
+        self.header_slider.setRange(0, 40)
+        self.header_slider.setValue(10)
         self.header_slider.setEnabled(False)
         h_layout.addWidget(self.header_slider)
         self.header_value_label = QLabel("15%")
@@ -384,8 +427,8 @@ class PDFKeywordFinderApp(QMainWindow):
         noise_layout.addWidget(QLabel("页脚区域 (%):"))
         f_layout = QHBoxLayout()
         self.footer_slider = QSlider(Qt.Horizontal)
-        self.footer_slider.setRange(70, 95)
-        self.footer_slider.setValue(85)
+        self.footer_slider.setRange(60, 100)
+        self.footer_slider.setValue(90)
         self.footer_slider.setEnabled(False)
         f_layout.addWidget(self.footer_slider)
         self.footer_value_label = QLabel("85%")
@@ -397,7 +440,7 @@ class PDFKeywordFinderApp(QMainWindow):
         noise_layout.addWidget(QLabel("重复率阈值 (%):"))
         r_layout = QHBoxLayout()
         self.threshold_slider = QSlider(Qt.Horizontal)
-        self.threshold_slider.setRange(10, 80)
+        self.threshold_slider.setRange(10, 95)
         self.threshold_slider.setValue(30)
         self.threshold_slider.setEnabled(False)
         r_layout.addWidget(self.threshold_slider)
