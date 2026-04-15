@@ -3,7 +3,7 @@ import os
 import json
 from pathlib import Path
 from typing import Dict, Optional
-
+import traceback
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QCheckBox, QSlider, QFileDialog,
@@ -29,12 +29,81 @@ except ImportError:
                     {'text': 'Mock Footer Noise', 'reason': 'Footer', 'page': 1, 'repeat_rate': 0.75}
                 ]
             }
+from datetime import datetime
 
+def global_exception_hook(exc_type, exc_value, exc_traceback):
+    """
+    全局异常捕捉器：当程序发生未捕获的致命异常时，自动将堆栈信息写入日志文件
+    """
+    log_file = "app_error_log.txt"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tb_lines = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    
+    try:
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*30} 未捕获异常 {timestamp} {'='*30}\n")
+            f.write(tb_lines)
+            f.write(f"{'='*70}\n")
+        print(f"⚠️ 发生严重错误，异常信息已记录至: {log_file}")
+    except Exception as e:
+        print(f"写入错误日志失败: {e}")
+ 
+    # 依然调用系统默认的异常处理，让控制台打印出红色错误
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+class ConsoleToFileTee:
+    """
+    上下文管理器：将控制台的所有输出（包括print和异常堆栈）同时重定向到控制台和指定的txt文件中。
+    """
+    def __init__(self, log_file_path: str):
+        self.log_file_path = log_file_path
+        self.terminal = sys.stdout       # 保存原始的标准输出
+        self.terminal_err = sys.stderr   # 保存原始的错误输出
+        self.log = None
+    def __enter__(self):
+        try:
+            # 以追加模式打开文件，保留历史记录
+            self.log = open(self.log_file_path, 'a', encoding='utf-8')
+            sys.stdout = self
+            sys.stderr = self
+            # 写入启动分隔符
+            separator = f"\n{'='*30} 应用启动 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {'='*30}\n"
+            self.terminal.write(separator)
+            if self.log:
+                self.log.write(separator)
+                self.log.flush()
+        except Exception as e:
+            # 如果文件创建失败，回退到纯控制台模式
+            self.terminal.write(f"无法打开日志文件 {self.log_file_path}: {e}\n")
+            sys.stdout = self.terminal
+            sys.stderr = self.terminal_err
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # 恢复系统默认输出流
+        sys.stdout = self.terminal
+        sys.stderr = self.terminal_err
+        if self.log and not self.log.closed:
+            # 写入退出分隔符
+            separator = f"{'='*30} 应用退出 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {'='*30}\n"
+            self.log.write(separator)
+            self.log.flush()
+            self.log.close()
+    def write(self, message):
+        # 同时向控制台和文件写入
+        self.terminal.write(message)
+        if self.log and not self.log.closed and message:
+            self.log.write(message)
+            self.log.flush()  # 实时刷新，确保即使程序崩溃日志也已写入
+    def flush(self):
+        # 刷新缓冲区
+        self.terminal.flush()
+        if self.log and not self.log.closed:
+            self.log.flush()
 
 class SearchWorker(QThread):
     """搜索工作线程，避免阻塞UI"""
     search_finished = Signal(dict)
-    search_error = Signal(str)
+    search_error = Signal(str, str)
 
     def __init__(self, params: dict):
         super().__init__()
@@ -48,7 +117,8 @@ class SearchWorker(QThread):
                 self.search_finished.emit(results)
         except Exception as e:
             if not self._cancel_flag:
-                self.search_error.emit(str(e))
+                error_detail = traceback.format_exc()
+                self.search_error.emit(str(e), error_detail)
 
     def cancel(self):
         self._cancel_flag = True
@@ -218,7 +288,7 @@ class PDFKeywordFinderApp(QMainWindow):
         super().__init__()
 
         # 窗口基本设置
-        self.setWindowTitle("解决方案中心工具")
+        self.setWindowTitle("联通数科（贵州）解决方案中心投标辅助工具v2.0")
         self.resize(1000, 750)
         self.setMinimumSize(900, 650)
 
@@ -390,7 +460,7 @@ class PDFKeywordFinderApp(QMainWindow):
         # 输出选项
         output_group = QGroupBox("输出选项")
         output_layout = QVBoxLayout()
-        self.txt_check = QCheckBox("输出 TXT 文件")
+        self.txt_check = QCheckBox("输出日志文件")
         self.txt_check.setChecked(True)
         output_layout.addWidget(self.txt_check)
         self.excel_check = QCheckBox("输出 Excel 文件")
@@ -687,8 +757,8 @@ class PDFKeywordFinderApp(QMainWindow):
         output_dir = self.output_entry.text() or str(Path(pdf_path).parent)
         os.makedirs(output_dir, exist_ok=True)
 
-        output_file = os.path.join(output_dir, f"{pdf_name}_keywords.txt") if self.txt_check.isChecked() else None
-        excel_file = os.path.join(output_dir, f"{pdf_name}_keywords.xlsx") if self.excel_check.isChecked() else None
+        output_file = os.path.join(output_dir, f"{pdf_name}_搜索日志.txt") if self.txt_check.isChecked() else None
+        excel_file = os.path.join(output_dir, f"{pdf_name}_关键字分析表.xlsx") if self.excel_check.isChecked() else None
 
         # 更新UI状态并启动进度条加载动画
         self.is_searching = True
@@ -730,33 +800,36 @@ class PDFKeywordFinderApp(QMainWindow):
         total_matches = results.get('total_matches', 0)
         message = f"搜索完成，找到 {total_matches} 处匹配，请前往输出目录查看文件。"
         self.progress_label.setText(message)
-        
-        noise_info = results.get('noise_info', [])
 
-        if noise_info:
-            self._show_noise_result(noise_info, message)
-        else:
-            QMessageBox.information(self, "完成", message)
-
-    def _on_search_error(self, error_msg: str):
+    def _on_search_error(self, error_msg: str, error_detail: str):
         """搜索失败回调"""
         self.is_searching = False
         self._set_ui_state(False)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_label.setText("搜索失败")
+        
+        # --- 新增：将工作线程的异常写入日志文件 ---
+        log_file = "app_error_log.txt"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'='*30} 搜索异常 {timestamp} {'='*30}\n")
+                f.write(error_detail)
+                f.write(f"{'='*70}\n")
+        except Exception as e:
+            print(f"写入错误日志失败: {e}")
+        # -----------------------------------------
         QMessageBox.critical(self, "错误", f"搜索失败:\n{error_msg}")
 
-    def _show_noise_result(self, noise_info: list, search_message: str):
-        """显示噪声检测结果"""
-        dialog = NoiseResultDialog(noise_info, self)
-        if dialog.exec() == QDialog.Accepted:
-            QMessageBox.information(self, "完成", search_message)
 
 
 def main():
+    # 挂载全局异常捕捉器，捕获UI线程未处理的异常
+    sys.excepthook = global_exception_hook
+ 
     app = QApplication(sys.argv)
-
+ 
     # 设置默认字体，避免Windows上的字体警告
     from PySide6.QtGui import QFontDatabase
     font_id = QFontDatabase.addApplicationFont("C:/Windows/Fonts/msyh.ttc")
@@ -768,11 +841,10 @@ def main():
             app.setFont(QFont("Segoe UI"))
     else:
         app.setFont(QFont("Segoe UI"))
-
+ 
     window = PDFKeywordFinderApp()
     window.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
