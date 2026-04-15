@@ -455,13 +455,18 @@ def find_keywords_in_pdf(
         keywords_list = keywords
         # 默认每字1分
         keywords_point = {k: 1 for k in keywords_list}
+    
+    # 输入值限制
+    front_window = min(80, front_window)
+    header_ratio = min(0.2, header_ratio)
+    footer_ratio = min(0.8, footer_ratio)
+    repeat_threshold = min(1, repeat_threshold)
 
     # 获取拼接后的文本（传入keywords用于保护用户关心的内容）
     full_text, block_info, noise_info, page_prifix_sum = get_page_text_with_layout(
         pdf_path,
         keywords=keywords_list,
         auto_clean_noise=auto_clean_noise,
-        check_pages=None,
         header_ratio=header_ratio,
         footer_ratio=footer_ratio,
         repeat_threshold=repeat_threshold

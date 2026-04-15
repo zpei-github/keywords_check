@@ -51,55 +51,6 @@ def global_exception_hook(exc_type, exc_value, exc_traceback):
     # 依然调用系统默认的异常处理，让控制台打印出红色错误
     sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
-class ConsoleToFileTee:
-    """
-    上下文管理器：将控制台的所有输出（包括print和异常堆栈）同时重定向到控制台和指定的txt文件中。
-    """
-    def __init__(self, log_file_path: str):
-        self.log_file_path = log_file_path
-        self.terminal = sys.stdout       # 保存原始的标准输出
-        self.terminal_err = sys.stderr   # 保存原始的错误输出
-        self.log = None
-    def __enter__(self):
-        try:
-            # 以追加模式打开文件，保留历史记录
-            self.log = open(self.log_file_path, 'a', encoding='utf-8')
-            sys.stdout = self
-            sys.stderr = self
-            # 写入启动分隔符
-            separator = f"\n{'='*30} 应用启动 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {'='*30}\n"
-            self.terminal.write(separator)
-            if self.log:
-                self.log.write(separator)
-                self.log.flush()
-        except Exception as e:
-            # 如果文件创建失败，回退到纯控制台模式
-            self.terminal.write(f"无法打开日志文件 {self.log_file_path}: {e}\n")
-            sys.stdout = self.terminal
-            sys.stderr = self.terminal_err
-        return self
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # 恢复系统默认输出流
-        sys.stdout = self.terminal
-        sys.stderr = self.terminal_err
-        if self.log and not self.log.closed:
-            # 写入退出分隔符
-            separator = f"{'='*30} 应用退出 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {'='*30}\n"
-            self.log.write(separator)
-            self.log.flush()
-            self.log.close()
-    def write(self, message):
-        # 同时向控制台和文件写入
-        self.terminal.write(message)
-        if self.log and not self.log.closed and message:
-            self.log.write(message)
-            self.log.flush()  # 实时刷新，确保即使程序崩溃日志也已写入
-    def flush(self):
-        # 刷新缓冲区
-        self.terminal.flush()
-        if self.log and not self.log.closed:
-            self.log.flush()
-
 class SearchWorker(QThread):
     """搜索工作线程，避免阻塞UI"""
     search_finished = Signal(dict)
@@ -122,163 +73,6 @@ class SearchWorker(QThread):
 
     def cancel(self):
         self._cancel_flag = True
-
-
-class NoiseResultDialog(QDialog):
-    """噪声检测结果弹窗"""
-    def __init__(self, noise_info: list, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("噪声检测结果")
-        self.resize(700, 500)
-
-        layout = QVBoxLayout(self)
-
-        title_label = QLabel("噪声检测完成")
-        title_label.setFont(QFont("", 14, QFont.Bold))
-        layout.addWidget(title_label)
-
-        # 数据聚合与统计
-        noise_aggregation = {}
-        for item in noise_info:
-            text = item.get('text', '')
-            if text not in noise_aggregation:
-                noise_aggregation[text] = {
-                    'text': text,
-                    'reason': item.get('reason', ''),
-                    'pages': set(),
-                    'repeat_rate': item.get('repeat_rate', 0),
-                    'position': item.get('position', '')
-                }
-            noise_aggregation[text]['pages'].add(item.get('page', ''))
-
-        unique_noise_list = list(noise_aggregation.values())
-
-        # 按类型和重复率排序：先'边缘位置+高频重复'，后'边缘位置+带有数字'
-        def sort_key(item):
-            reason = item.get('reason', '')
-            repeat_rate = item.get('repeat_rate', 0)
-            # 排序优先级：高频重复=0，数字=1，其他=2
-            if '高频重复' in reason:
-                priority = 0
-            elif '数字' in reason:
-                priority = 1
-            else:
-                priority = 2
-            return (priority, -repeat_rate)  # 负号表示降序
-
-        unique_noise_list.sort(key=sort_key)
-
-        reason_count = {}
-        for item in unique_noise_list:
-            reason = item.get('reason', '未知')
-            reason_count[reason] = reason_count.get(reason, 0) + 1
-
-        total_unique = len(unique_noise_list)
-        total_blocks = len(noise_info)
-
-        # 按排序顺序显示统计
-        summary = f"共检测到 {total_blocks} 个噪声block，去重后 {total_unique} 种\n\n按类型统计:\n"
-        # 按优先级显示
-        reason_order = ['边缘位置+高频重复', '边缘位置+带有数字']
-        for reason in reason_order:
-            if reason in reason_count:
-                summary += f"  • {reason}: {reason_count[reason]}种\n"
-        # 显示其他类型
-        for reason, count in reason_count.items():
-            if reason not in reason_order:
-                summary += f"  • {reason}: {count}种\n"
-
-        summary_label = QLabel(summary)
-        summary_label.setWordWrap(True)
-        layout.addWidget(summary_label)
-
-        detail_label = QLabel("去重后的噪声详情（按类型排序，类型内按重复率降序）:")
-        detail_label.setFont(QFont("", -1, QFont.Bold))
-        layout.addWidget(detail_label)
-
-        # 详细列表显示
-        text_browser = QTextBrowser()
-        text_browser.setOpenExternalLinks(False)
-        details = []
-
-        # 追踪当前类型，添加分组标题
-        current_reason = None
-        for item in unique_noise_list[:15]:
-            reason = item.get('reason', '未知')
-            repeat_rate = item.get('repeat_rate', 0)
-            pages = item.get('pages', set())
-            text = item.get('text', '')
-            display_text = text[:50] + '...' if len(text) > 50 else text
-
-            # 类型变化时添加分组标题
-            if current_reason != reason:
-                details.append(f"\n【{reason}】")
-                current_reason = reason
-
-            details.append(f"  • 重复率:{repeat_rate:.1%} | 页数:{len(pages)}页 | 内容: {display_text}")
-
-        if len(unique_noise_list) > 15:
-            details.append(f"\n... 还有 {len(unique_noise_list) - 15} 种噪声未显示")
-
-        text_browser.setText("\n".join(details))
-        layout.addWidget(text_browser)
-
-        # 添加查看完整列表的展开功能
-        self.expand_btn = QPushButton("查看全部噪声详情")
-        self.expand_btn.clicked.connect(lambda: self._show_full_list(unique_noise_list))
-        layout.addWidget(self.expand_btn)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        ok_btn = QPushButton("确定")
-        ok_btn.clicked.connect(self.accept)
-        btn_layout.addWidget(ok_btn)
-        layout.addLayout(btn_layout)
-
-    def _show_full_list(self, unique_noise_list: list):
-        """显示完整的噪声列表"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("全部噪声详情")
-        dialog.resize(700, 500)
-
-        layout = QVBoxLayout(dialog)
-
-        text_browser = QTextBrowser()
-        text_browser.setOpenExternalLinks(False)
-        details = []
-
-        # 按分组显示
-        current_reason = None
-        group_idx = 0
-        for item in unique_noise_list:
-            text = item.get('text', '')
-            reason = item.get('reason', '未知')
-            repeat_rate = item.get('repeat_rate', 0)
-            pages = item.get('pages', set())
-            pages_str = ', '.join(sorted(str(p) for p in pages)) if pages else 'N/A'
-            position = item.get('position')
-            # 类型变化时添加分组标题
-            if current_reason != reason:
-                if current_reason is not None:
-                    details.append("")
-                details.append(f"【{reason}】")
-                current_reason = reason
-                group_idx = 1  # 组内序号
-
-            details.append(f"  {group_idx}. 重复率:{repeat_rate:.1%} | 位置:{position} | 页码: {pages_str}\n     内容: {text}")
-            group_idx += 1
-
-        text_browser.setText("\n".join(details))
-        layout.addWidget(text_browser)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(dialog.close)
-        btn_layout.addWidget(close_btn)
-        layout.addLayout(btn_layout)
-
-        dialog.exec()
 
 
 class PDFKeywordFinderApp(QMainWindow):
@@ -435,7 +229,7 @@ class PDFKeywordFinderApp(QMainWindow):
         context_layout.addWidget(QLabel("上下文丰富度:"))
         context_slider_layout = QHBoxLayout()
         self.context_slider = QSlider(Qt.Horizontal)
-        self.context_slider.setRange(50, 1000)
+        self.context_slider.setRange(50, 800)
         self.context_slider.setSingleStep(50)
         self.context_slider.setValue(200)
         self.context_slider.setTickPosition(QSlider.TicksBelow)
@@ -484,7 +278,7 @@ class PDFKeywordFinderApp(QMainWindow):
         noise_layout.addWidget(QLabel("页眉区域 (%):"))
         h_layout = QHBoxLayout()
         self.header_slider = QSlider(Qt.Horizontal)
-        self.header_slider.setRange(0, 40)
+        self.header_slider.setRange(0, 20)
         self.header_slider.setValue(10)
         self.header_slider.setEnabled(False)
         h_layout.addWidget(self.header_slider)
@@ -497,7 +291,7 @@ class PDFKeywordFinderApp(QMainWindow):
         noise_layout.addWidget(QLabel("页脚区域 (%):"))
         f_layout = QHBoxLayout()
         self.footer_slider = QSlider(Qt.Horizontal)
-        self.footer_slider.setRange(60, 100)
+        self.footer_slider.setRange(80, 100)
         self.footer_slider.setValue(90)
         self.footer_slider.setEnabled(False)
         f_layout.addWidget(self.footer_slider)
@@ -510,7 +304,7 @@ class PDFKeywordFinderApp(QMainWindow):
         noise_layout.addWidget(QLabel("重复率阈值 (%):"))
         r_layout = QHBoxLayout()
         self.threshold_slider = QSlider(Qt.Horizontal)
-        self.threshold_slider.setRange(10, 95)
+        self.threshold_slider.setRange(50, 95)
         self.threshold_slider.setValue(30)
         self.threshold_slider.setEnabled(False)
         r_layout.addWidget(self.threshold_slider)
@@ -765,12 +559,13 @@ class PDFKeywordFinderApp(QMainWindow):
         self._set_ui_state(True)
         self.progress_bar.setRange(0, 0)  # 切换为不确定进度条(滚动动画)
         self.progress_label.setText("正在搜索...")
+        front_window = min(80, int(self.front_entry.text() or 0))
 
         # 实例化并启动工作线程
         self.search_worker = SearchWorker({
             "pdf_path": pdf_path,
             "context_rich": self.context_slider.value(),
-            "front_window": int(self.front_entry.text() or 0),
+            "front_window": front_window ,
             "keywords": self.keywords.copy(),
             "output_file": output_file,
             "excel_file": excel_file,
