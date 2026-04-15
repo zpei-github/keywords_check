@@ -267,9 +267,9 @@ class PDFKeywordFinderApp(QMainWindow):
         layout.addWidget(output_group)
 
         # 噪声检测设置
-        noise_group = QGroupBox("噪声检测设置")
+        noise_group = QGroupBox("噪声去除设置")
         noise_layout = QVBoxLayout()
-        self.noise_check = QCheckBox("自动检测页眉页脚水印")
+        self.noise_check = QCheckBox("页面裁剪功能")
         self.noise_check.setChecked(False)
         self.noise_check.toggled.connect(self._toggle_noise_params)
         noise_layout.addWidget(self.noise_check)
