@@ -665,60 +665,43 @@ def map_match_to_blocks(
 
 
 def find_quads_in_block(page, block_no: int, block_text: str,
-                        frag_start: int, frag_end: int) -> list:
+                        frag_start: int, frag_end: int,
+                        block_bbox, block_words) -> list:
     """
     在指定page的指定block中定位文本片段，返回Quad列表用于高亮。
 
-    策略:
-      1. 先用 page.search_for 搜索，按block的bbox过滤结果
-      2. 若失败，用 page.get_text("words") 按block_no过滤后拼接匹配
+    参数:
+        block_bbox: 该block的bbox [x0,y0,x1,y1]（外部预计算缓存）
+        block_words: 该block的words列表 [(x0,y0,x1,y1,"text",...)]（外部预计算缓存）
     """
     sub_text = block_text[frag_start:frag_end]
     if not sub_text.strip():
         return []
 
-    # --- 策略1: search_for + bbox过滤 ---
-    rects = page.search_for(sub_text)
+    # 策略1: search_for + clip到block区域 → 精确且高效
+    if block_bbox:
+        clip_rect = fitz.Rect(block_bbox)
+        rects = page.search_for(sub_text, clip=clip_rect)
+        if rects:
+            return [r.quad for r in rects]
 
-    page_dict = page.get_text("dict")
-    block_bbox = None
-    for b in page_dict["blocks"]:
-        if b.get("number") == block_no and b.get("type") == 0:
-            block_bbox = b["bbox"]
-            break
-
-    if rects and block_bbox:
-        quads = []
-        for rect in rects:
-            if rect.y0 >= block_bbox[1] - 2 and rect.y1 <= block_bbox[3] + 2:
-                quads.append(rect.quad)
-        if quads:
-            return quads
-
-    # --- 策略2: words级定位(处理block内跨行) ---
-    words = page.get_text("words", sort=True)
-    block_words = [w for w in words if w[5] == block_no]
+    # 策略2: words级定位（处理block内跨行，或block_bbox缺失时）
     if not block_words:
         return []
 
-    # 拼接word文本并建立位置→word映射
     word_text = ''.join(w[4] for w in block_words)
     idx = word_text.find(sub_text)
     if idx == -1:
         return []
 
-    # 确定覆盖的words
+    quads = []
     pos = 0
-    word_ranges = []  # [(start, end, bbox)]
     for w in block_words:
         wlen = len(w[4])
-        word_ranges.append((pos, pos + wlen, w[:4]))
-        pos += wlen
-
-    quads = []
-    for w_start, w_end, bbox in word_ranges:
-        if w_end > idx and w_start < idx + len(sub_text):
-            quads.append(fitz.Rect(bbox).quad)
+        w_end = pos + wlen
+        if w_end > idx and pos < idx + len(sub_text):
+            quads.append(fitz.Rect(w[:4]).quad)
+        pos = w_end
     return quads
 
 
@@ -732,8 +715,8 @@ def export_pdf_with_highlight(
 	"""
 	导出带有高亮关键字的PDF文件，支持跨行和跨页关键字。
 
-	基于搜索阶段已算出的all_matchs（关键字在full_text中的精确位置），
-	通过block级前缀和+双指针映射回原始PDF block，在对应block中定位并高亮。
+	性能优化：get_text("dict") 和 get_text("words") 每页仅调用一次，
+	将block_bbox和block_words缓存后分发给各fragment复用。
 
 	参数:
 		pdf_path: 原始PDF文件路径
@@ -748,20 +731,19 @@ def export_pdf_with_highlight(
 
 	print(f"正在生成高亮PDF文件: {output_pdf_path}")
 
-	# 将match映射到block
 	mappings = map_match_to_blocks(all_matchs, block_info)
 	if not mappings:
 		print("无法映射匹配到block，跳过高亮")
 		return
 
-	# 按页组织block，减少重复打开页面的开销
-	page_blocks = {}  # page_num -> [(block_no, block_text, frag_start, frag_end)]
+	# 按页组织fragment，并对同一block的片段去重
+	page_fragments = {}  # page -> [(block_no, block_text, frag_start, frag_end)]
 	for mapping in mappings:
 		for blk in mapping['blocks']:
 			page = blk['page']
-			if page not in page_blocks:
-				page_blocks[page] = []
-			page_blocks[page].append((
+			if page not in page_fragments:
+				page_fragments[page] = []
+			page_fragments[page].append((
 				blk['block_no'], block_info[blk['block_idx']]['text'],
 				blk['frag_start'], blk['frag_end']
 			))
@@ -769,18 +751,37 @@ def export_pdf_with_highlight(
 	doc = fitz.open(pdf_path)
 	total_quads = 0
 
-	for page_num, items in page_blocks.items():
-		page = doc[page_num - 1]  # 页码从1开始，doc索引从0开始
+	for page_num, fragments in page_fragments.items():
+		page = doc[page_num - 1]
 
-		# 对同一block的多个片段去重合并
+		# === 每页一次性构建缓存（核心性能优化） ===
+		page_dict = page.get_text("dict")
+		block_bbox_cache = {}
+		for b in page_dict["blocks"]:
+			if b.get("type") == 0:
+				block_bbox_cache[b.get("number")] = b["bbox"]
+
+		page_words = page.get_text("words", sort=True)
+		block_words_cache = {}
+		for w in page_words:
+			bn = w[5]  # block_no
+			if bn not in block_words_cache:
+				block_words_cache[bn] = []
+			block_words_cache[bn].append(w)
+		# =============================================
+
 		seen = set()
-		for block_no, block_text, frag_start, frag_end in items:
+		for block_no, block_text, frag_start, frag_end in fragments:
 			key = (block_no, frag_start, frag_end)
 			if key in seen:
 				continue
 			seen.add(key)
 
-			quads = find_quads_in_block(page, block_no, block_text, frag_start, frag_end)
+			quads = find_quads_in_block(
+				page, block_no, block_text, frag_start, frag_end,
+				block_bbox_cache.get(block_no),
+				block_words_cache.get(block_no, [])
+			)
 			for quad in quads:
 				annot = page.add_highlight_annot(quads=[quad])
 				annot.set_colors(stroke=color)
