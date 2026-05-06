@@ -22,7 +22,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 from openpyxl.cell.text import InlineFont
-import array
+
 
 
 # 预编译正则表达式
@@ -41,7 +41,6 @@ DEFAULT_MIN_TEXT_LENGTH = 3   # 最小文本长度
 def detect_noise_blocks(
     all_blocks: List[Dict],
     keywords_pattern: Pattern,
-    keywords: List[str] = None,
     header_ratio: float = DEFAULT_HEADER_RATIO,
     footer_ratio: float = DEFAULT_FOOTER_RATIO,
     repeat_threshold: float = DEFAULT_REPEAT_THRESHOLD,
@@ -57,7 +56,6 @@ def detect_noise_blocks(
 
     参数:
         all_blocks: 所有block信息
-        keywords: 关键字列表（用于保护用户关心的内容）
         header_ratio: 页眉区域占比
         footer_ratio: 页脚区域占比
         repeat_threshold: 重复率阈值
@@ -99,8 +97,6 @@ def detect_noise_blocks(
         y0 = block.get('y0', 0)
         y1 = block.get('y1', 0)
         page_height = block['page_height']
-        if block['page'] == 37:
-            pass
 
         # 规则1（重要）：关键字保护 - 包含关键字的block不当作噪声
         if keywords_pattern.search(text):
@@ -231,8 +227,7 @@ def get_page_text_with_layout(
 
     # 第一遍：收集所有block信息（包括坐标）
     raw_blocks = []
-    page_heights = {}
-    
+
     # 前缀和记录每页字符数前缀和
     page_prifix_sum = [0] * (len(doc) + 1)
 
@@ -240,7 +235,6 @@ def get_page_text_with_layout(
 
         page = doc[page_num]
         page_height = page.rect.height
-        page_heights[page_num + 1] = page_height
         blocks = page.get_text_blocks()
 
         for block in blocks:
@@ -271,7 +265,6 @@ def get_page_text_with_layout(
         noise_indices, noise_info = detect_noise_blocks(
             blocks_to_check,
             keywords_pattern= keywords_pattern,
-            keywords=keywords,
             header_ratio=header_ratio,
             footer_ratio=footer_ratio,
             repeat_threshold=repeat_threshold
@@ -527,15 +520,14 @@ def find_keywords_in_pdf(
         score = sum(keywords_point.get(kw, 1) for kw in result['keywords'])
         result['score'] = score
 
-    	# 按页码组织结果
+    # 按页码组织结果
     page_results = {}
-    page_keywords_map = {}  # 【新增】记录每页出现的关键字，用于加速高亮PDF导出
 
-	# results已按sentence_start升序排列，使用双指针优化
+    # results已按sentence_start升序排列，使用双指针优化
     last_page = 1
     last_end_page = 1
     for result in results:
-		# 使用 page_prifix_sum 前缀和计算页码（更准确）
+        # 使用 page_prifix_sum 前缀和计算页码（更准确）
         pos = result.get('sentence_start', result['position'])
         sentence_end = result.get('sentence_end', result['position'])
         # 从上次位置继续向下遍历（利用升序排列）
@@ -554,15 +546,6 @@ def find_keywords_in_pdf(
             page_results[page_num] = []
         page_results[page_num].append(result)
 
-
-        # 【新增】收集每页的关键字集合（含跨页处理）
-        if page_num not in page_keywords_map:
-            page_keywords_map[page_num] = set()
-        page_keywords_map[page_num].update(result['keywords'])
-        if is_cross_page:
-            if end_page not in page_keywords_map:
-                page_keywords_map[end_page] = set()
-            page_keywords_map[end_page].update(result['keywords'])
 
     # 保存到txt文件
     if output_file:
@@ -706,91 +689,91 @@ def find_quads_in_block(page, block_no: int, block_text: str,
 
 
 def export_pdf_with_highlight(
-	pdf_path: str,
-	output_pdf_path: str,
-	all_matchs: List[Dict],
-	block_info: List[Dict],
-	color: Tuple[float, float, float] = (1, 1, 0)
+    pdf_path: str,
+    output_pdf_path: str,
+    all_matchs: List[Dict],
+    block_info: List[Dict],
+    color: Tuple[float, float, float] = (1, 1, 0)
  ):
-	"""
-	导出带有高亮关键字的PDF文件，支持跨行和跨页关键字。
+    """
+    导出带有高亮关键字的PDF文件，支持跨行和跨页关键字。
 
-	性能优化：get_text("dict") 和 get_text("words") 每页仅调用一次，
-	将block_bbox和block_words缓存后分发给各fragment复用。
+    性能优化：get_text("dict") 和 get_text("words") 每页仅调用一次，
+    将block_bbox和block_words缓存后分发给各fragment复用。
 
-	参数:
-		pdf_path: 原始PDF文件路径
-		output_pdf_path: 导出的高亮PDF文件路径
-		all_matchs: 关键字匹配列表 [{keyword, start, end}, ...]
-		block_info: block信息列表 [{page, block_no, text, position}, ...]
-		color: 高亮颜色，RGB格式的元组，取值范围0-1，默认为黄色(1, 1, 0)
-	"""
-	if not all_matchs:
-		print("没有匹配的关键字，跳过高亮PDF生成")
-		return
+    参数:
+        pdf_path: 原始PDF文件路径
+        output_pdf_path: 导出的高亮PDF文件路径
+        all_matchs: 关键字匹配列表 [{keyword, start, end}, ...]
+        block_info: block信息列表 [{page, block_no, text, position}, ...]
+        color: 高亮颜色，RGB格式的元组，取值范围0-1，默认为黄色(1, 1, 0)
+    """
+    if not all_matchs:
+        print("没有匹配的关键字，跳过高亮PDF生成")
+        return
 
-	print(f"正在生成高亮PDF文件: {output_pdf_path}")
+    print(f"正在生成高亮PDF文件: {output_pdf_path}")
 
-	mappings = map_match_to_blocks(all_matchs, block_info)
-	if not mappings:
-		print("无法映射匹配到block，跳过高亮")
-		return
+    mappings = map_match_to_blocks(all_matchs, block_info)
+    if not mappings:
+        print("无法映射匹配到block，跳过高亮")
+        return
 
-	# 按页组织fragment，并对同一block的片段去重
-	page_fragments = {}  # page -> [(block_no, block_text, frag_start, frag_end)]
-	for mapping in mappings:
-		for blk in mapping['blocks']:
-			page = blk['page']
-			if page not in page_fragments:
-				page_fragments[page] = []
-			page_fragments[page].append((
-				blk['block_no'], block_info[blk['block_idx']]['text'],
-				blk['frag_start'], blk['frag_end']
-			))
+    # 按页组织fragment，并对同一block的片段去重
+    page_fragments = {}  # page -> [(block_no, block_text, frag_start, frag_end)]
+    for mapping in mappings:
+        for blk in mapping['blocks']:
+            page = blk['page']
+            if page not in page_fragments:
+                page_fragments[page] = []
+            page_fragments[page].append((
+                blk['block_no'], block_info[blk['block_idx']]['text'],
+                blk['frag_start'], blk['frag_end']
+            ))
 
-	doc = fitz.open(pdf_path)
-	total_quads = 0
+    doc = fitz.open(pdf_path)
+    total_quads = 0
 
-	for page_num, fragments in page_fragments.items():
-		page = doc[page_num - 1]
+    for page_num, fragments in page_fragments.items():
+        page = doc[page_num - 1]
 
-		# === 每页一次性构建缓存（核心性能优化） ===
-		page_dict = page.get_text("dict")
-		block_bbox_cache = {}
-		for b in page_dict["blocks"]:
-			if b.get("type") == 0:
-				block_bbox_cache[b.get("number")] = b["bbox"]
+        # === 每页一次性构建缓存（核心性能优化） ===
+        page_dict = page.get_text("dict")
+        block_bbox_cache = {}
+        for b in page_dict["blocks"]:
+            if b.get("type") == 0:
+                block_bbox_cache[b.get("number")] = b["bbox"]
 
-		page_words = page.get_text("words", sort=True)
-		block_words_cache = {}
-		for w in page_words:
-			bn = w[5]  # block_no
-			if bn not in block_words_cache:
-				block_words_cache[bn] = []
-			block_words_cache[bn].append(w)
-		# =============================================
+        page_words = page.get_text("words", sort=True)
+        block_words_cache = {}
+        for w in page_words:
+            bn = w[5]  # block_no
+            if bn not in block_words_cache:
+                block_words_cache[bn] = []
+            block_words_cache[bn].append(w)
+        # =============================================
 
-		seen = set()
-		for block_no, block_text, frag_start, frag_end in fragments:
-			key = (block_no, frag_start, frag_end)
-			if key in seen:
-				continue
-			seen.add(key)
+        seen = set()
+        for block_no, block_text, frag_start, frag_end in fragments:
+            key = (block_no, frag_start, frag_end)
+            if key in seen:
+                continue
+            seen.add(key)
 
-			quads = find_quads_in_block(
-				page, block_no, block_text, frag_start, frag_end,
-				block_bbox_cache.get(block_no),
-				block_words_cache.get(block_no, [])
-			)
-			for quad in quads:
-				annot = page.add_highlight_annot(quads=[quad])
-				annot.set_colors(stroke=color)
-				annot.update()
-				total_quads += 1
+            quads = find_quads_in_block(
+                page, block_no, block_text, frag_start, frag_end,
+                block_bbox_cache.get(block_no),
+                block_words_cache.get(block_no, [])
+            )
+            for quad in quads:
+                annot = page.add_highlight_annot(quads=[quad])
+                annot.set_colors(stroke=color)
+                annot.update()
+                total_quads += 1
 
-	doc.save(output_pdf_path, garbage=4, deflate=True)
-	doc.close()
-	print(f"高亮PDF已保存到: {output_pdf_path} (共 {total_quads} 处高亮)")
+    doc.save(output_pdf_path, garbage=4, deflate=True)
+    doc.close()
+    print(f"高亮PDF已保存到: {output_pdf_path} (共 {total_quads} 处高亮)")
 
 def export_to_txt( 
         output_file: str,
@@ -847,9 +830,9 @@ def export_to_txt(
             if cross_page_count > 0:
                 f.write(f"\n跨页句子数: {cross_page_count}\n")
 
-            # 4. 搜索结果详情（按页码顺序）
+            # 3. 搜索结果详情（按页码顺序）
             f.write("\n" + "=" * 80 + "\n")
-            f.write("【三、 搜索结果详情 - 按页码顺序】\n")
+            f.write("【二、 搜索结果详情 - 按页码顺序】\n")
             f.write("-" * 80 + "\n")
             for page_num in sorted(page_results.keys()):
                 f.write(f"\n--- 第 {page_num} 页 ---\n")
@@ -864,9 +847,9 @@ def export_to_txt(
                     f.write(f"   {sentence}\n")
                          
 
-            # 5. 噪音检测结果
+            # 4. 噪音检测结果
             f.write("\n" + "=" * 80 + "\n")
-            f.write("【四、 噪音检测结果】\n")
+            f.write("【三、 噪音检测结果】\n")
             f.write("-" * 80 + "\n")
             if noise_info:
                 f.write(f"共检测到 {len(noise_info)} 个可能被过滤的页眉/页脚/水印block:\n\n")
@@ -899,11 +882,11 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
     red_font = InlineFont(color='00FF0000')
     default_font = InlineFont(color='00000000')
 
-    ws.merge_cells('A1:H1')
+    ws.merge_cells('A1:I1')
     ws['A1'] = f"PDF关键字搜索结果 - {pdf_path}"
     ws['A1'].font = Font(bold=True, size=14)
 
-    ws.merge_cells('A2:H2')
+    ws.merge_cells('A2:I2')
     keywords_info = ', '.join([f"{k}({v}分)" for k, v in keywords_point.items()])
     ws['A2'] = f"搜索关键字: {keywords_info}"
     ws['A2'].font = Font(italic=True)
