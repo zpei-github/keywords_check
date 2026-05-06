@@ -1,0 +1,65 @@
+
+============================== 搜索异常 2026-05-06 20:05:32 ==============================
+Traceback (most recent call last):
+  File "E:\Git\Python\keywords_check\gui.py", line 66, in run
+    results = pdf_keyword_finder.find_keywords_in_pdf(**self.params)
+  File "E:\Git\Python\keywords_check\pdf_keyword_finder.py", line 587, in find_keywords_in_pdf
+    export_pdf_with_highlight(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        pdf_path=pdf_path,
+        ^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        block_info=block_info
+        ^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "E:\Git\Python\keywords_check\pdf_keyword_finder.py", line 783, in export_pdf_with_highlight
+    quads = find_quads_in_block(page, block_no, block_text, frag_start, frag_end)
+  File "E:\Git\Python\keywords_check\pdf_keyword_finder.py", line 694, in find_quads_in_block
+    quads.append(fitz.Quad(rect))
+                 ~~~~~~~~~^^^^^^
+  File "E:\Git\Python\keywords_check\venv\Lib\site-packages\pymupdf\__init__.py", line 14396, in __init__
+    self.ul, self.ur, self.ll, self.lr = map(Point, l)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Git\Python\keywords_check\venv\Lib\site-packages\pymupdf\__init__.py", line 14178, in __init__
+    raise ValueError("Point: bad args")
+ValueError: Point: bad args
+======================================================================
+
+============================== 搜索异常 2026-05-06 20:08:16 ==============================
+Traceback (most recent call last):
+  File "E:\Git\Python\keywords_check\gui.py", line 66, in run
+    results = pdf_keyword_finder.find_keywords_in_pdf(**self.params)
+  File "E:\Git\Python\keywords_check\pdf_keyword_finder.py", line 587, in find_keywords_in_pdf
+    export_pdf_with_highlight(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        pdf_path=pdf_path,
+        ^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        block_info=block_info
+        ^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "E:\Git\Python\keywords_check\pdf_keyword_finder.py", line 783, in export_pdf_with_highlight
+    quads = find_quads_in_block(page, block_no, block_text, frag_start, frag_end)
+  File "E:\Git\Python\keywords_check\pdf_keyword_finder.py", line 694, in find_quads_in_block
+    quads.append(fitz.Quad(rect))
+                 ~~~~~~~~~^^^^^^
+  File "E:\Git\Python\keywords_check\venv\Lib\site-packages\pymupdf\__init__.py", line 14396, in __init__
+    self.ul, self.ur, self.ll, self.lr = map(Point, l)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Git\Python\keywords_check\venv\Lib\site-packages\pymupdf\__init__.py", line 14178, in __init__
+    raise ValueError("Point: bad args")
+ValueError: Point: bad args
+======================================================================
+
+============================== 未捕获异常 2026-05-06 20:09:38 ==============================
+Traceback (most recent call last):
+  File "E:\Git\Python\keywords_check\gui.py", line 626, in _on_search_error
+    QMessageBox.critical(self, "错误", f"搜索失败:\n{error_msg}")
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Program Files\Python\python313\Lib\enum.py", line 696, in __call__
+    def __call__(cls, value, names=_not_given, *values, module=None, qualname=None, type=None, start=1, boundary=None):
+    
+KeyboardInterrupt
+======================================================================

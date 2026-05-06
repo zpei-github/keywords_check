@@ -233,7 +233,7 @@ def get_page_text_with_layout(
     raw_blocks = []
     page_heights = {}
     
-    # 前缀和记录每页字符数和每页关键字的blocks前缀和
+    # 前缀和记录每页字符数前缀和
     page_prifix_sum = [0] * (len(doc) + 1)
 
     for page_num in range(len(doc)):
@@ -581,7 +581,15 @@ def find_keywords_in_pdf(
     if excel_file:
         export_to_excel(results, excel_file, pdf_path, keywords_point)
         print(f"Excel已保存到: {excel_file}")
-    
+
+    # 导出高亮PDF
+    if highlight_pdf:
+        export_pdf_with_highlight(
+            pdf_path=pdf_path,
+            output_pdf_path=highlight_pdf,
+            all_matchs=all_matchs,
+            block_info=block_info
+        )
 
     return {
         'total_matches': len(results),
@@ -592,52 +600,196 @@ def find_keywords_in_pdf(
 
 
 
-def export_pdf_with_highlight( 
-	pdf_path: str, 
-	output_pdf_path: str, 
-	keywords: List[str], 
-	page_keywords_map: Dict[int, set] = None,
+def map_match_to_blocks(
+    all_matchs: List[Dict],
+    block_info: List[Dict]
+) -> List[Dict]:
+    """
+    将full_text中的关键字匹配位置映射回原始PDF block。
+    使用block级前缀和 + 双指针遍历，O(n+m)复杂度。
+
+    参数:
+        all_matchs: [{keyword, start, end}, ...]，已按start升序
+        block_info: [{page, block_no, text, position}, ...]
+
+    返回:
+        [{match_idx, keyword, blocks: [{block_idx, page, block_no, frag_start, frag_end, sub_text}]}]
+    """
+    if not all_matchs or not block_info:
+        return []
+
+    n = len(block_info)
+    mappings = []
+    p = 0  # 起始block指针
+
+    for match_idx, match in enumerate(all_matchs):
+        match_start = match['start']
+        match_end = match['end']
+
+        # 双指针定位起始block: block_end = position + len(text)
+        while p < n - 1 and match_start >= block_info[p]['position'] + len(block_info[p]['text']):
+            p += 1
+
+        # 双指针定位结束block
+        q = p
+        while q < n - 1 and match_end > block_info[q + 1]['position']:
+            q += 1
+
+        # 收集涉及的blocks
+        blocks = []
+        for i in range(p, q + 1):
+            bi = block_info[i]
+            block_start = bi['position']
+            block_text_len = len(bi['text'])
+
+            frag_start = max(0, match_start - block_start)
+            frag_end = min(block_text_len, match_end - block_start)
+
+            if frag_start < frag_end:
+                blocks.append({
+                    'block_idx': i,
+                    'page': bi['page'],
+                    'block_no': bi['block_no'],
+                    'frag_start': frag_start,
+                    'frag_end': frag_end,
+                    'sub_text': bi['text'][frag_start:frag_end]
+                })
+
+        mappings.append({
+            'match_idx': match_idx,
+            'keyword': match['keyword'],
+            'blocks': blocks
+        })
+
+    return mappings
+
+
+def find_quads_in_block(page, block_no: int, block_text: str,
+                        frag_start: int, frag_end: int) -> list:
+    """
+    在指定page的指定block中定位文本片段，返回Quad列表用于高亮。
+
+    策略:
+      1. 先用 page.search_for 搜索，按block的bbox过滤结果
+      2. 若失败，用 page.get_text("words") 按block_no过滤后拼接匹配
+    """
+    sub_text = block_text[frag_start:frag_end]
+    if not sub_text.strip():
+        return []
+
+    # --- 策略1: search_for + bbox过滤 ---
+    rects = page.search_for(sub_text)
+
+    page_dict = page.get_text("dict")
+    block_bbox = None
+    for b in page_dict["blocks"]:
+        if b.get("number") == block_no and b.get("type") == 0:
+            block_bbox = b["bbox"]
+            break
+
+    if rects and block_bbox:
+        quads = []
+        for rect in rects:
+            if rect.y0 >= block_bbox[1] - 2 and rect.y1 <= block_bbox[3] + 2:
+                quads.append(rect.quad)
+        if quads:
+            return quads
+
+    # --- 策略2: words级定位(处理block内跨行) ---
+    words = page.get_text("words", sort=True)
+    block_words = [w for w in words if w[5] == block_no]
+    if not block_words:
+        return []
+
+    # 拼接word文本并建立位置→word映射
+    word_text = ''.join(w[4] for w in block_words)
+    idx = word_text.find(sub_text)
+    if idx == -1:
+        return []
+
+    # 确定覆盖的words
+    pos = 0
+    word_ranges = []  # [(start, end, bbox)]
+    for w in block_words:
+        wlen = len(w[4])
+        word_ranges.append((pos, pos + wlen, w[:4]))
+        pos += wlen
+
+    quads = []
+    for w_start, w_end, bbox in word_ranges:
+        if w_end > idx and w_start < idx + len(sub_text):
+            quads.append(fitz.Rect(bbox).quad)
+    return quads
+
+
+def export_pdf_with_highlight(
+	pdf_path: str,
+	output_pdf_path: str,
+	all_matchs: List[Dict],
+	block_info: List[Dict],
 	color: Tuple[float, float, float] = (1, 1, 0)
  ):
 	"""
-	导出带有高亮关键字的PDF文件，复用搜索结果提升性能
+	导出带有高亮关键字的PDF文件，支持跨行和跨页关键字。
+
+	基于搜索阶段已算出的all_matchs（关键字在full_text中的精确位置），
+	通过block级前缀和+双指针映射回原始PDF block，在对应block中定位并高亮。
+
 	参数:
 		pdf_path: 原始PDF文件路径
 		output_pdf_path: 导出的高亮PDF文件路径
-		keywords: 需要高亮的关键字列表
-		page_keywords_map: 复用搜索结果(页码->关键字集合)，用于仅处理命中页
+		all_matchs: 关键字匹配列表 [{keyword, start, end}, ...]
+		block_info: block信息列表 [{page, block_no, text, position}, ...]
 		color: 高亮颜色，RGB格式的元组，取值范围0-1，默认为黄色(1, 1, 0)
 	"""
+	if not all_matchs:
+		print("没有匹配的关键字，跳过高亮PDF生成")
+		return
+
 	print(f"正在生成高亮PDF文件: {output_pdf_path}")
+
+	# 将match映射到block
+	mappings = map_match_to_blocks(all_matchs, block_info)
+	if not mappings:
+		print("无法映射匹配到block，跳过高亮")
+		return
+
+	# 按页组织block，减少重复打开页面的开销
+	page_blocks = {}  # page_num -> [(block_no, block_text, frag_start, frag_end)]
+	for mapping in mappings:
+		for blk in mapping['blocks']:
+			page = blk['page']
+			if page not in page_blocks:
+				page_blocks[page] = []
+			page_blocks[page].append((
+				blk['block_no'], block_info[blk['block_idx']]['text'],
+				blk['frag_start'], blk['frag_end']
+			))
+
 	doc = fitz.open(pdf_path)
-	for page_num_0 in range(len(doc)):
-		page_num_1 = page_num_0 + 1  # 页码从1开始
-		# 如果有复用信息且当前页不在其中，直接跳过，极大提升速度
-		if page_keywords_map is not None and page_num_1 not in page_keywords_map:
-			continue
-		page = doc[page_num_0]
-		# 确定当前页需要搜索的关键字集合（若有复用信息则取该页子集，否则取全量）
-		target_kws = page_keywords_map.get(page_num_1, set(keywords)) if page_keywords_map else set(keywords)
-		# 构建仅包含本页目标关键字的正则，减少匹配开销
-		escaped_target = [re.escape(kw) for kw in target_kws]
-		target_pattern = re.compile('(' + '|'.join(escaped_target) + ')', re.IGNORECASE)
-		# 提取当前页的原始文本
-		page_text = page.get_text("text")
-		# 找出本页出现的所有关键字大小写变体
-		actual_matches = set(match.group() for match in target_pattern.finditer(page_text))
-		actual_matches.update(target_kws) # 补充原始关键字，避免因提取差异导致的遗漏
-		for kw in actual_matches:
-			text_instances = page.search_for(kw)
-			if text_instances:
-				# 1. 添加高亮注释
-				annot = page.add_highlight_annot(text_instances)
-				# 2. 设置颜色
+	total_quads = 0
+
+	for page_num, items in page_blocks.items():
+		page = doc[page_num - 1]  # 页码从1开始，doc索引从0开始
+
+		# 对同一block的多个片段去重合并
+		seen = set()
+		for block_no, block_text, frag_start, frag_end in items:
+			key = (block_no, frag_start, frag_end)
+			if key in seen:
+				continue
+			seen.add(key)
+
+			quads = find_quads_in_block(page, block_no, block_text, frag_start, frag_end)
+			for quad in quads:
+				annot = page.add_highlight_annot(quads=[quad])
 				annot.set_colors(stroke=color)
-				# 3. 更新注释使其生效
 				annot.update()
+				total_quads += 1
+
 	doc.save(output_pdf_path, garbage=4, deflate=True)
 	doc.close()
-	print(f"高亮PDF已保存到: {output_pdf_path}")
+	print(f"高亮PDF已保存到: {output_pdf_path} (共 {total_quads} 处高亮)")
 
 def export_to_txt( 
         output_file: str,
@@ -861,7 +1013,7 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
 # 使用示例
 if __name__ == "__main__":
     # 示例：搜索单个PDF文件
-    pdf_path = r"E:\Desktop\招标文件-副本.pdf"  # 替换为你的PDF文件路径
+    pdf_path = r"E:\Desktop\0515数据专线采购项目\采购文件\数据专线采购项目GQQY-ZB2026040210.pdf"  # 替换为你的PDF文件路径
 
     # 定义要搜索的关键字及分数
     keywords_point = {

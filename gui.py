@@ -263,6 +263,9 @@ class PDFKeywordFinderApp(QMainWindow):
         self.sort_check = QCheckBox("按重要性排序")
         self.sort_check.setChecked(True)
         output_layout.addWidget(self.sort_check)
+        self.highlight_check = QCheckBox("输出高亮 PDF")
+        self.highlight_check.setChecked(True)
+        output_layout.addWidget(self.highlight_check)
         output_group.setLayout(output_layout)
         layout.addWidget(output_group)
 
@@ -361,6 +364,7 @@ class PDFKeywordFinderApp(QMainWindow):
         self.txt_check.setEnabled(state)
         self.excel_check.setEnabled(state)
         self.sort_check.setEnabled(state)
+        self.highlight_check.setEnabled(state)
         
         self.search_btn.setEnabled(state)
         self.cancel_btn.setEnabled(is_searching)
@@ -483,6 +487,7 @@ class PDFKeywordFinderApp(QMainWindow):
                     "front_window": int(self.front_entry.text() or 0),
                     "output_txt": self.txt_check.isChecked(),
                     "output_excel": self.excel_check.isChecked(),
+                    "output_highlight": self.highlight_check.isChecked(),
                     "sort_by_importance": self.sort_check.isChecked(),
                     "auto_clean_noise": self.noise_check.isChecked(),
                     "header_ratio": self.header_slider.value() / 100.0,
@@ -515,6 +520,7 @@ class PDFKeywordFinderApp(QMainWindow):
                     if "front_window" in settings: self.front_entry.setText(str(settings["front_window"]))
                     if "output_txt" in settings: self.txt_check.setChecked(settings["output_txt"])
                     if "output_excel" in settings: self.excel_check.setChecked(settings["output_excel"])
+                    if "output_highlight" in settings: self.highlight_check.setChecked(settings["output_highlight"])
                     if "sort_by_importance" in settings: self.sort_check.setChecked(settings["sort_by_importance"])
                     if "auto_clean_noise" in settings: self.noise_check.setChecked(settings["auto_clean_noise"])
                     if "header_ratio" in settings: self.header_slider.setValue(int(settings["header_ratio"] * 100))
@@ -553,6 +559,7 @@ class PDFKeywordFinderApp(QMainWindow):
 
         output_file = os.path.join(output_dir, f"{pdf_name}_搜索日志.txt") if self.txt_check.isChecked() else None
         excel_file = os.path.join(output_dir, f"{pdf_name}_关键字分析表.xlsx") if self.excel_check.isChecked() else None
+        highlight_pdf = os.path.join(output_dir, f"{pdf_name}_高亮版.pdf") if self.highlight_check.isChecked() else None
 
         # 更新UI状态并启动进度条加载动画
         self.is_searching = True
@@ -569,6 +576,7 @@ class PDFKeywordFinderApp(QMainWindow):
             "keywords": self.keywords.copy(),
             "output_file": output_file,
             "excel_file": excel_file,
+            "highlight_pdf": highlight_pdf,
             "auto_clean_noise": self.noise_check.isChecked(),
             "header_ratio": self.header_slider.value() / 100.0,
             "footer_ratio": self.footer_slider.value() / 100.0,
