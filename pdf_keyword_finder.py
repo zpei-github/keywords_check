@@ -16,11 +16,13 @@ PDF关键字搜索工具
 
 import fitz  # PyMuPDF
 import re
+from re import Pattern
 from typing import List, Dict, Tuple, Union
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.cell.rich_text import CellRichText, TextBlock
 from openpyxl.cell.text import InlineFont
+import array
 
 
 # 预编译正则表达式
@@ -38,6 +40,7 @@ DEFAULT_MIN_TEXT_LENGTH = 3   # 最小文本长度
 
 def detect_noise_blocks(
     all_blocks: List[Dict],
+    keywords_pattern: Pattern,
     keywords: List[str] = None,
     header_ratio: float = DEFAULT_HEADER_RATIO,
     footer_ratio: float = DEFAULT_FOOTER_RATIO,
@@ -67,16 +70,6 @@ def detect_noise_blocks(
         return set(), []
     total_pages = len(set(b['page'] for b in all_blocks))
     if total_pages == 0:
-        return set(), []
-    # 构建关键字正则模式（用于保护包含关键字的内容）
-    keyword_pattern = None
-    if keywords:
-        escaped_keywords = [re.escape(kw) for kw in keywords]
-        keyword_pattern = re.compile('(' + '|'.join(escaped_keywords) + ')', re.IGNORECASE)
-    else:
-        return set(), []
-    
-    if not keyword_pattern:
         return set(), []
 
     # 统计每个文本内容在不同页面出现的次数（用于检测重复的页眉页脚）
@@ -110,7 +103,7 @@ def detect_noise_blocks(
             pass
 
         # 规则1（重要）：关键字保护 - 包含关键字的block不当作噪声
-        if keyword_pattern.search(text):
+        if keywords_pattern.search(text):
             continue  # 保留       
         
         # 边缘判断和重复率判断基准
@@ -129,7 +122,7 @@ def detect_noise_blocks(
                 next_text = next_block['text']
 
                 combined = text + next_text
-                all_match = keyword_pattern.finditer(combined)
+                all_match = keywords_pattern.finditer(combined)
                 for match in all_match:
                     if match.start() < len(text):
                         continue
@@ -138,7 +131,7 @@ def detect_noise_blocks(
                 last_text = last_block['text']
                 next_block = all_blocks[idx + 1]
                 next_text = next_block['text']
-                all_match = keyword_pattern.finditer(last_text + text + next_text)
+                all_match = keywords_pattern.finditer(last_text + text + next_text)
                 
                 for match in all_match:
                     if (match.start() >= len(last_text) and match.start() < len(last_text + text)) or (match.end() >= len(last_text) and match.end() < len(last_text + text)) or (match.end() >= len(last_text + text) and match.start() < len(last_text)):
@@ -146,7 +139,7 @@ def detect_noise_blocks(
             else:
                 last_block = all_blocks[idx - 1]
                 last_text = last_block['text']
-                all_match = keyword_pattern.finditer(last_text+ text)
+                all_match = keywords_pattern.finditer(last_text+ text)
                 for match in all_match:
                     if match.end() >= len(last_text):
                         continue
@@ -173,7 +166,7 @@ def detect_noise_blocks(
                 next_text = next_block['text']
 
                 combined = text + next_text
-                all_match = keyword_pattern.finditer(combined)
+                all_match = keywords_pattern.finditer(combined)
                 for match in all_match:
                     if match.start() < len(text):
                         continue
@@ -182,7 +175,7 @@ def detect_noise_blocks(
                 last_text = last_block['text']
                 next_block = all_blocks[idx + 1]
                 next_text = next_block['text']
-                all_match = keyword_pattern.finditer(last_text + text + next_text)
+                all_match = keywords_pattern.finditer(last_text + text + next_text)
                 
                 for match in all_match:
                     if (match.start() >= len(last_text) and match.start() < len(last_text + text)) or (match.end() >= len(last_text) and match.end() < len(last_text + text)) or (match.end() >= len(last_text + text) and match.start() < len(last_text)):
@@ -190,7 +183,7 @@ def detect_noise_blocks(
             else:
                 last_block = all_blocks[idx - 1]
                 last_text = last_block['text']
-                all_match = keyword_pattern.finditer(last_text+ text)
+                all_match = keywords_pattern.finditer(last_text+ text)
                 for match in all_match:
                     if match.end() >= len(last_text):
                         continue
@@ -210,6 +203,7 @@ def detect_noise_blocks(
 
 def get_page_text_with_layout(
     pdf_path: str,
+    keywords_pattern:Pattern,
     keywords: List[str] = None,
     auto_clean_noise: bool = False,
     header_ratio: float = DEFAULT_HEADER_RATIO,
@@ -239,26 +233,25 @@ def get_page_text_with_layout(
     raw_blocks = []
     page_heights = {}
     
-    # 前缀和记录每页字符数
-    page_prifix_sum = []
-    page_prifix_sum.append(0)
+    # 前缀和记录每页字符数和每页关键字的blocks前缀和
+    page_prifix_sum = [0] * (len(doc) + 1)
 
     for page_num in range(len(doc)):
+
         page = doc[page_num]
         page_height = page.rect.height
         page_heights[page_num + 1] = page_height
         blocks = page.get_text_blocks()
 
-        # page_prifix_sum初始化
-        page_prifix_sum.append(0)
-
         for block in blocks:
             x0, y0, x1, y1, text, block_no, block_type = block
+
             # 只处理文本块
             if block_type == 0 and text.strip():
                 # 去除block内的换行符
                 clean_text = text.replace('\n', '').replace('\r', '')
                 clean_text = WHITESPACE_PATTERN.sub(' ', clean_text).strip()
+
                 if clean_text:
                     raw_blocks.append({
                         'page': page_num + 1,
@@ -267,18 +260,17 @@ def get_page_text_with_layout(
                         'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
                         'page_height': page_height
                     })
-            
-
     doc.close()
 
     # 自动检测噪声block
     noise_indices = set()
     noise_info = []
+
     if auto_clean_noise:
-        # 限制检测的页面数量以提高性能
         blocks_to_check = raw_blocks
         noise_indices, noise_info = detect_noise_blocks(
             blocks_to_check,
+            keywords_pattern= keywords_pattern,
             keywords=keywords,
             header_ratio=header_ratio,
             footer_ratio=footer_ratio,
@@ -322,6 +314,7 @@ def get_page_text_with_layout(
 
 def find_keywords_in_text(
     full_text: str,
+    keywords_pattern: Pattern,
     keywords: List[str],
     context_chars: int,
     front_window: int
@@ -331,17 +324,10 @@ def find_keywords_in_text(
 
     优化：合并所有关键字为单个正则模式，一次遍历完成匹配
     """
-    if not keywords:
-        return [],[]
-
-    # 构建合并的正则模式：(keyword1|keyword2|...)
-    # 使用 re.escape 确保特殊字符正确处理
-    escaped_keywords = [re.escape(kw) for kw in keywords]
-    pattern = re.compile('(' + '|'.join(escaped_keywords) + ')', re.IGNORECASE)
-
+   
     # 一次遍历收集所有匹配
     all_matches = []
-    for match in pattern.finditer(full_text):
+    for match in keywords_pattern.finditer(full_text):
         matched_text = match.group()
         # 找到匹配的是哪个关键字（保持原始大小写）
         for keyword in keywords:
@@ -387,12 +373,17 @@ def find_keywords_in_text(
             continue
         last = merged[-1]
 
-        if item['sentence_end'] >= last['sentence_end'] and item['sentence_start'] == last['sentence_start']:
+        if item['sentence_end'] > last['sentence_end'] and item['sentence_start'] == last['sentence_start']:
             item['keywords'].update(last['keywords'])
 
             # 取最靠前的关键字position
             item["position"] = min(item["position"], last["position"])
             merged[-1] = item
+        elif item['sentence_end'] <= last['sentence_end'] and item['sentence_start'] >= last['sentence_start']:
+            last['keywords'].update(item['keywords'])
+
+            # 取最靠前的关键字position
+            last["position"] = min(item["position"], last["position"])
         else:
             merged.append(item)
     return merged, all_matches
@@ -458,6 +449,7 @@ def find_keywords_in_pdf(
     keywords: List[str] | Dict[str, int],
     output_file: str | None = None,
     excel_file: str | None = None,
+    highlight_pdf: str | None = None,
     auto_clean_noise: bool = False,
     header_ratio: float = DEFAULT_HEADER_RATIO,
     footer_ratio: float = DEFAULT_FOOTER_RATIO,
@@ -487,6 +479,19 @@ def find_keywords_in_pdf(
         # 默认每字1分
         keywords_point = {k: 1 for k in keywords_list}
     
+    if not keywords_list or len(keywords_list) == 0:
+        return {
+        'total_matches': 0,
+        'by_page': {},
+        'all_results':[],
+        'noise_info': []
+    }
+
+    # 构建合并的正则模式：(keyword1|keyword2|...)
+    # 使用 re.escape 确保特殊字符正确处理
+    escaped_keywords = [re.escape(kw) for kw in keywords_list]
+    pattern = re.compile('(' + '|'.join(escaped_keywords) + ')', re.IGNORECASE)
+    
     # 输入值限制
     front_window = min(80, front_window)
     header_ratio = min(0.2, header_ratio)
@@ -496,6 +501,7 @@ def find_keywords_in_pdf(
     # 获取拼接后的文本（传入keywords用于保护用户关心的内容）
     full_text, block_info, noise_info, page_prifix_sum = get_page_text_with_layout(
         pdf_path,
+        keywords_pattern=pattern,
         keywords=keywords_list,
         auto_clean_noise=auto_clean_noise,
         header_ratio=header_ratio,
@@ -506,7 +512,13 @@ def find_keywords_in_pdf(
 
     # 搜索关键字
     print(f"正在搜索关键字: {keywords_list}")
-    results, all_matchs = find_keywords_in_text(full_text, keywords_list, context_rich, front_window)
+    results, all_matchs = find_keywords_in_text(
+        full_text = full_text, 
+        keywords_pattern= pattern,
+        keywords = keywords_list, 
+        context_chars = context_rich, 
+        front_window = front_window
+        )
 
     print(f"\n找到 {len(results)} 处匹配")
 
@@ -515,35 +527,42 @@ def find_keywords_in_pdf(
         score = sum(keywords_point.get(kw, 1) for kw in result['keywords'])
         result['score'] = score
 
-    # 按页码组织结果
+    	# 按页码组织结果
     page_results = {}
+    page_keywords_map = {}  # 【新增】记录每页出现的关键字，用于加速高亮PDF导出
 
-    # results已按sentence_start升序排列，使用双指针优化
+	# results已按sentence_start升序排列，使用双指针优化
     last_page = 1
     last_end_page = 1
     for result in results:
-        # 使用 page_prifix_sum 前缀和计算页码（更准确）
+		# 使用 page_prifix_sum 前缀和计算页码（更准确）
         pos = result.get('sentence_start', result['position'])
         sentence_end = result.get('sentence_end', result['position'])
-
         # 从上次位置继续向下遍历（利用升序排列）
         while last_page < len(page_prifix_sum) and pos >= page_prifix_sum[last_page]:
             last_page += 1
         page_num = last_page
-
         while last_end_page < len(page_prifix_sum) and sentence_end >= page_prifix_sum[last_end_page]:
             last_end_page += 1
         end_page = last_end_page
-
         # 如果起始页和结束页不同，标记为跨页
         is_cross_page = (end_page != page_num)
         result['page'] = page_num
         result['is_cross_page'] = is_cross_page
         result['end_page'] = end_page
-
         if page_num not in page_results:
             page_results[page_num] = []
         page_results[page_num].append(result)
+
+
+        # 【新增】收集每页的关键字集合（含跨页处理）
+        if page_num not in page_keywords_map:
+            page_keywords_map[page_num] = set()
+        page_keywords_map[page_num].update(result['keywords'])
+        if is_cross_page:
+            if end_page not in page_keywords_map:
+                page_keywords_map[end_page] = set()
+            page_keywords_map[end_page].update(result['keywords'])
 
     # 保存到txt文件
     if output_file:
@@ -562,6 +581,7 @@ def find_keywords_in_pdf(
     if excel_file:
         export_to_excel(results, excel_file, pdf_path, keywords_point)
         print(f"Excel已保存到: {excel_file}")
+    
 
     return {
         'total_matches': len(results),
@@ -570,6 +590,54 @@ def find_keywords_in_pdf(
         'noise_info': noise_info
     }
 
+
+
+def export_pdf_with_highlight( 
+	pdf_path: str, 
+	output_pdf_path: str, 
+	keywords: List[str], 
+	page_keywords_map: Dict[int, set] = None,
+	color: Tuple[float, float, float] = (1, 1, 0)
+ ):
+	"""
+	导出带有高亮关键字的PDF文件，复用搜索结果提升性能
+	参数:
+		pdf_path: 原始PDF文件路径
+		output_pdf_path: 导出的高亮PDF文件路径
+		keywords: 需要高亮的关键字列表
+		page_keywords_map: 复用搜索结果(页码->关键字集合)，用于仅处理命中页
+		color: 高亮颜色，RGB格式的元组，取值范围0-1，默认为黄色(1, 1, 0)
+	"""
+	print(f"正在生成高亮PDF文件: {output_pdf_path}")
+	doc = fitz.open(pdf_path)
+	for page_num_0 in range(len(doc)):
+		page_num_1 = page_num_0 + 1  # 页码从1开始
+		# 如果有复用信息且当前页不在其中，直接跳过，极大提升速度
+		if page_keywords_map is not None and page_num_1 not in page_keywords_map:
+			continue
+		page = doc[page_num_0]
+		# 确定当前页需要搜索的关键字集合（若有复用信息则取该页子集，否则取全量）
+		target_kws = page_keywords_map.get(page_num_1, set(keywords)) if page_keywords_map else set(keywords)
+		# 构建仅包含本页目标关键字的正则，减少匹配开销
+		escaped_target = [re.escape(kw) for kw in target_kws]
+		target_pattern = re.compile('(' + '|'.join(escaped_target) + ')', re.IGNORECASE)
+		# 提取当前页的原始文本
+		page_text = page.get_text("text")
+		# 找出本页出现的所有关键字大小写变体
+		actual_matches = set(match.group() for match in target_pattern.finditer(page_text))
+		actual_matches.update(target_kws) # 补充原始关键字，避免因提取差异导致的遗漏
+		for kw in actual_matches:
+			text_instances = page.search_for(kw)
+			if text_instances:
+				# 1. 添加高亮注释
+				annot = page.add_highlight_annot(text_instances)
+				# 2. 设置颜色
+				annot.set_colors(stroke=color)
+				# 3. 更新注释使其生效
+				annot.update()
+	doc.save(output_pdf_path, garbage=4, deflate=True)
+	doc.close()
+	print(f"高亮PDF已保存到: {output_pdf_path}")
 
 def export_to_txt( 
         output_file: str,
@@ -620,7 +688,7 @@ def export_to_txt(
                 count = keyword_counts.get(kw, 0)
                 if count > 0:
                     score = keyword_scores.get(kw, 0)
-                    f.write(f"  - {kw}: 命中 {count} 次, 贡献得分 {score}\n")
+                    f.write(f"  - {kw}: 命中 {count} 次\n")
             # 跨页统计
             cross_page_count = sum(1 for r in results if r.get('is_cross_page', False))
             if cross_page_count > 0:
@@ -651,7 +719,7 @@ def export_to_txt(
                 f.write(f"共检测到 {len(noise_info)} 个可能被过滤的页眉/页脚/水印block:\n\n")
                 for item in noise_info:
                     f.write(f"    - 重复率: {item['repeat_rate']:.1%} | 原因: {item['reason']}  |  位置: {item['position']}  |  页码:  {item['page']}\n")
-                    f.write(f"      内容: {item['text']}\n")
+                    f.write(f"      内容: {item['text']}\n\n")
             else:
                 f.write("未检测到明显的页眉/页脚/水印噪音。\n")
         print(f"\n深度分析报告已保存到: {output_file}")
@@ -687,7 +755,7 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
     ws['A2'] = f"搜索关键字: {keywords_info}"
     ws['A2'].font = Font(italic=True)
 
-    headers = ['排名', '重要性', '得分', '始页', '终页', '包含关键字', '完整句子', '备注']
+    headers = ['排名', '重要性', '得分', '始页', '终页','上下文始坐标', '关键字', '上下文', '备注']
     for col, header in enumerate(headers, 1):
         cell = ws.cell(row=4, column=col, value=header)
         cell.font = header_font_white
@@ -700,9 +768,10 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
     ws.column_dimensions['C'].width = 8
     ws.column_dimensions['D'].width = 8
     ws.column_dimensions['E'].width = 8
-    ws.column_dimensions['F'].width = 20
-    ws.column_dimensions['G'].width = 60
-    ws.column_dimensions['H'].width = 15
+    ws.column_dimensions['F'].width = 8
+    ws.column_dimensions['G'].width = 20
+    ws.column_dimensions['H'].width = 60
+    ws.column_dimensions['I'].width = 15
 
     max_score = max((r.get('score', 0) for r in sorted_results), default=1)
 
@@ -739,17 +808,19 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
         # 始页和终页
         start_page = result.get('page', result.get('page', 1))
         end_page = result.get('end_page', start_page)
+        sentence_start = result.get('sentence_start', result['position'])
         ws.cell(row=row, column=4, value=start_page).border = thin_border
         ws.cell(row=row, column=5, value=end_page).border = thin_border
+        ws.cell(row=row, column=6, value=sentence_start).border = thin_border
 
         # 包含关键字
-        ws.cell(row=row, column=6, value=', '.join(result['keywords'])).border = thin_border
-        ws.cell(row=row, column=6).alignment = wrap_alignment
+        ws.cell(row=row, column=7, value=', '.join(result['keywords'])).border = thin_border
+        ws.cell(row=row, column=7).alignment = wrap_alignment
 
         # ===================== 标红逻辑 =====================
         sentence = result['sentence']
         keywords = result.get('keywords', [])
-        sentence_cell = ws.cell(row=row, column=7)
+        sentence_cell = ws.cell(row=row, column=8)
 
         if not keywords:
             sentence_cell.value = sentence
@@ -775,7 +846,7 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
         # 备注栏：显示跨页信息
         is_cross_page = result.get('is_cross_page', False)
         remark = "跨页" if is_cross_page else ""
-        remark_cell = ws.cell(row=row, column=8, value=remark)
+        remark_cell = ws.cell(row=row, column=9, value=remark)
         remark_cell.border = thin_border
         if is_cross_page:
             remark_cell.fill = PatternFill(start_color="FFE699", end_color="FFE699", fill_type="solid")
@@ -790,7 +861,7 @@ def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keyword
 # 使用示例
 if __name__ == "__main__":
     # 示例：搜索单个PDF文件
-    pdf_path = r"E:\Desktop\0423投标-振华群英网络改造项目\（招标文件）0730-2611GZ011901；网络改造项目（售卖稿）.pdf"  # 替换为你的PDF文件路径
+    pdf_path = r"E:\Desktop\招标文件-副本.pdf"  # 替换为你的PDF文件路径
 
     # 定义要搜索的关键字及分数
     keywords_point = {
@@ -826,7 +897,7 @@ if __name__ == "__main__":
         front_window= 0,
         output_file=r"E:\Desktop\output.txt",  # 可选：保存txt结果
         excel_file=r"E:\Desktop\output.xlsx",  # 可选：保存Excel结果（按重要性排序）
-
+        highlight_pdf=r"E:\Desktop\output.pdf",
         #==================噪声检测配置==================
         auto_clean_noise=True,  # 开启自动检测页眉页脚和水印
         header_ratio=0.4,      # 页眉区域占比

@@ -229,7 +229,7 @@ class PDFKeywordFinderApp(QMainWindow):
         context_layout.addWidget(QLabel("上下文丰富度:"))
         context_slider_layout = QHBoxLayout()
         self.context_slider = QSlider(Qt.Horizontal)
-        self.context_slider.setRange(50, 800)
+        self.context_slider.setRange(0, 1000)
         self.context_slider.setSingleStep(50)
         self.context_slider.setValue(200)
         self.context_slider.setTickPosition(QSlider.TicksBelow)
