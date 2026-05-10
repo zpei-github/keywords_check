@@ -16,8 +16,10 @@ PDF关键字搜索工具
 
 import fitz  # PyMuPDF
 import re
+import os
 from re import Pattern
 from typing import List, Dict, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.cell.rich_text import CellRichText, TextBlock
@@ -27,6 +29,7 @@ from openpyxl.cell.text import InlineFont
 
 # 预编译正则表达式
 WHITESPACE_PATTERN = re.compile(r'\s+')
+DIGIT_PATTERN = re.compile(r'\d')
 EXTRA_BOUNDARY_CHARS = set(',，;；')
 BOUNDARY_CHARS = set('。！？!?')
 IGNOR_CHARS = set('(（注')
@@ -36,6 +39,34 @@ DEFAULT_HEADER_RATIO = 0.15   # 页眉区域占比（顶部）
 DEFAULT_FOOTER_RATIO = 0.85   # 页脚区域占比（底部）
 DEFAULT_REPEAT_THRESHOLD = 0.3  # 重复率阈值
 DEFAULT_MIN_TEXT_LENGTH = 3   # 最小文本长度
+
+
+def build_keywords_pattern(keywords: List[str]) -> Tuple[Pattern, Dict[str, str], List[str]]:
+    """
+    构建关键字正则和大小写无关的关键字映射。
+
+    长关键字优先，避免 "证明" 抢先匹配 "证明材料" 这类包含关系关键字。
+    """
+    keyword_lookup = {}
+    unique_keywords = []
+
+    for keyword in keywords:
+        if not keyword:
+            continue
+        key = keyword.casefold()
+        if key in keyword_lookup:
+            continue
+        keyword_lookup[key] = keyword
+        unique_keywords.append(keyword)
+
+    if not unique_keywords:
+        return re.compile(r'(?!x)x'), {}, []
+
+    escaped_keywords = [
+        re.escape(keyword)
+        for keyword in sorted(unique_keywords, key=len, reverse=True)
+    ]
+    return re.compile('|'.join(escaped_keywords), re.IGNORECASE), keyword_lookup, unique_keywords
 
 
 def detect_noise_blocks(
@@ -108,90 +139,79 @@ def detect_noise_blocks(
 
         # 规则3：位置 + 重复率判断
         if is_at_edge and is_repeated:
-            '''
-            规则1.5（重要）：跨行关键字保护 - 边缘位置block拼接上一个/下一个block检测关键字
-            
-            当关键字被pdf文件中的换行符切分后, 正则表达式是无法匹配的, 需要重新拼接之后再匹配
-            '''
+            # 跨行关键字保护：边缘位置block拼接相邻block检测关键字
+            # 当关键字被PDF换行符切分后，正则无法直接匹配，需拼接后检测
+            is_protected = False
             if idx == 0 and idx + 1 < len(all_blocks):
-                next_block = all_blocks[idx + 1]
-                next_text = next_block['text']
-
-                combined = text + next_text
-                all_match = keywords_pattern.finditer(combined)
-                for match in all_match:
+                next_text = all_blocks[idx + 1]['text']
+                for match in keywords_pattern.finditer(text + next_text):
                     if match.start() < len(text):
-                        continue
+                        is_protected = True
+                        break
             elif idx + 1 < len(all_blocks) and idx - 1 >= 0:
-                last_block = all_blocks[idx - 1]
-                last_text = last_block['text']
-                next_block = all_blocks[idx + 1]
-                next_text = next_block['text']
-                all_match = keywords_pattern.finditer(last_text + text + next_text)
-                
-                for match in all_match:
-                    if (match.start() >= len(last_text) and match.start() < len(last_text + text)) or (match.end() >= len(last_text) and match.end() < len(last_text + text)) or (match.end() >= len(last_text + text) and match.start() < len(last_text)):
-                        continue
+                last_text = all_blocks[idx - 1]['text']
+                next_text = all_blocks[idx + 1]['text']
+                for match in keywords_pattern.finditer(last_text + text + next_text):
+                    if (match.start() >= len(last_text) and match.start() < len(last_text + text)) \
+                       or (match.end() >= len(last_text) and match.end() < len(last_text + text)) \
+                       or (match.end() >= len(last_text + text) and match.start() < len(last_text)):
+                        is_protected = True
+                        break
             else:
-                last_block = all_blocks[idx - 1]
-                last_text = last_block['text']
-                all_match = keywords_pattern.finditer(last_text+ text)
-                for match in all_match:
-                    if match.end() >= len(last_text):
-                        continue
-            noise_indices.add(idx)
-            noise_info.append({
-                'page': block['page'],
-                'block_no': block['block_no'],
-                'text': text[:50] + '...' if len(text) > 50 else text,
-                'repeat_rate': len(text_occurrences.get(text, set())) / total_pages,
-                'reason': '边缘位置+高频重复',
-                'position': '页眉' if y0 < page_height * header_ratio else '页脚'
-            })
+                last_text = all_blocks[idx - 1]['text']
+                for match in keywords_pattern.finditer(last_text + text):
+                    if match.end() > len(last_text):
+                        is_protected = True
+                        break
+
+            if not is_protected:
+                noise_indices.add(idx)
+                noise_info.append({
+                    'page': block['page'],
+                    'block_no': block['block_no'],
+                    'text': text[:50] + '...' if len(text) > 50 else text,
+                    'repeat_rate': len(text_occurrences.get(text, set())) / total_pages,
+                    'reason': '边缘位置+高频重复',
+                    'position': '页眉' if y0 < page_height * header_ratio else '页脚'
+                })
             continue
 
         # 规则2：包含数字的文本且在边缘位置（可能是页码、页眉页脚中的页码）
-        if re.search(r'\d', text) and is_at_edge:
-            '''
-            规则1.5（重要）：跨行关键字保护 - 边缘位置block拼接上一个/下一个block检测关键字
-            
-            当关键字被pdf文件中的换行符切分后, 正则表达式是无法匹配的, 需要重新拼接之后再匹配
-            '''
+        if DIGIT_PATTERN.search(text) and is_at_edge:
+            # 跨行关键字保护：边缘位置block拼接相邻block检测关键字
+            is_protected = False
             if idx == 0 and idx + 1 < len(all_blocks):
-                next_block = all_blocks[idx + 1]
-                next_text = next_block['text']
-
-                combined = text + next_text
-                all_match = keywords_pattern.finditer(combined)
-                for match in all_match:
+                next_text = all_blocks[idx + 1]['text']
+                for match in keywords_pattern.finditer(text + next_text):
                     if match.start() < len(text):
-                        continue
+                        is_protected = True
+                        break
             elif idx + 1 < len(all_blocks) and idx - 1 >= 0:
-                last_block = all_blocks[idx - 1]
-                last_text = last_block['text']
-                next_block = all_blocks[idx + 1]
-                next_text = next_block['text']
-                all_match = keywords_pattern.finditer(last_text + text + next_text)
-                
-                for match in all_match:
-                    if (match.start() >= len(last_text) and match.start() < len(last_text + text)) or (match.end() >= len(last_text) and match.end() < len(last_text + text)) or (match.end() >= len(last_text + text) and match.start() < len(last_text)):
-                        continue
+                last_text = all_blocks[idx - 1]['text']
+                next_text = all_blocks[idx + 1]['text']
+                for match in keywords_pattern.finditer(last_text + text + next_text):
+                    if (match.start() >= len(last_text) and match.start() < len(last_text + text)) \
+                       or (match.end() >= len(last_text) and match.end() < len(last_text + text)) \
+                       or (match.end() >= len(last_text + text) and match.start() < len(last_text)):
+                        is_protected = True
+                        break
             else:
-                last_block = all_blocks[idx - 1]
-                last_text = last_block['text']
-                all_match = keywords_pattern.finditer(last_text+ text)
-                for match in all_match:
-                    if match.end() >= len(last_text):
-                        continue
-            noise_indices.add(idx)
-            noise_info.append({
-                'page': block['page'],
-                'block_no': block['block_no'],
-                'text': text,
-                'repeat_rate': 0,
-                'reason': '边缘位置+带有数字',
-                'position': '页眉' if y0 < page_height * header_ratio else '页脚'
-            })
+                last_text = all_blocks[idx - 1]['text']
+                for match in keywords_pattern.finditer(last_text + text):
+                    if match.end() > len(last_text):
+                        is_protected = True
+                        break
+
+            if not is_protected:
+                noise_indices.add(idx)
+                noise_info.append({
+                    'page': block['page'],
+                    'block_no': block['block_no'],
+                    'text': text,
+                    'repeat_rate': 0,
+                    'reason': '边缘位置+带有数字',
+                    'position': '页眉' if y0 < page_height * header_ratio else '页脚'
+                })
             continue
 
     return noise_indices, noise_info
@@ -200,7 +220,6 @@ def detect_noise_blocks(
 def get_page_text_with_layout(
     pdf_path: str,
     keywords_pattern:Pattern,
-    keywords: List[str] = None,
     auto_clean_noise: bool = False,
     header_ratio: float = DEFAULT_HEADER_RATIO,
     footer_ratio: float = DEFAULT_FOOTER_RATIO,
@@ -213,15 +232,13 @@ def get_page_text_with_layout(
 
     参数:
         pdf_path: PDF文件路径
-        keywords: 关键字列表（用于保护用户关心的内容，不过滤包含关键字的block）
         auto_clean_noise: 是否自动检测并去除页眉页脚页码
         header_ratio: 页眉区域占比（默认15%）
         footer_ratio: 页脚区域占比（默认85%）
         repeat_threshold: 重复率阈值（默认30%）
-        check_pages: 采样检测的页数（默认全部）
 
     返回:
-        (拼接后的完整文本, block信息列表, 噪声信息列表)
+        (拼接后的完整文本, block信息列表, 噪声信息列表, 页码前缀和数组)
     """
     doc = fitz.open(pdf_path)
 
@@ -310,7 +327,8 @@ def find_keywords_in_text(
     keywords_pattern: Pattern,
     keywords: List[str],
     context_chars: int,
-    front_window: int
+    front_window: int,
+    keyword_lookup: Dict[str, str] = None
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     在文本中搜索关键字，返回完整句子（去重后）
@@ -318,19 +336,21 @@ def find_keywords_in_text(
     优化：合并所有关键字为单个正则模式，一次遍历完成匹配
     """
    
+    if keyword_lookup is None:
+        keyword_lookup = {keyword.casefold(): keyword for keyword in keywords}
+
     # 一次遍历收集所有匹配
     all_matches = []
     for match in keywords_pattern.finditer(full_text):
         matched_text = match.group()
-        # 找到匹配的是哪个关键字（保持原始大小写）
-        for keyword in keywords:
-            if keyword.lower() == matched_text.lower():
-                all_matches.append({
-                    'keyword': keyword,
-                    'start': match.start(),
-                    'end': match.end()
-                })
-                break
+        keyword = keyword_lookup.get(matched_text.casefold())
+        if keyword is None:
+            continue
+        all_matches.append({
+            'keyword': keyword,
+            'start': match.start(),
+            'end': match.end()
+        })
 
     if not all_matches:
         return [],[]
@@ -446,7 +466,8 @@ def find_keywords_in_pdf(
     auto_clean_noise: bool = False,
     header_ratio: float = DEFAULT_HEADER_RATIO,
     footer_ratio: float = DEFAULT_FOOTER_RATIO,
-    repeat_threshold: float = DEFAULT_REPEAT_THRESHOLD
+    repeat_threshold: float = DEFAULT_REPEAT_THRESHOLD,
+    sort_by_importance: bool = True
 ) -> Dict:
     """
     在PDF中搜索关键字并返回结果
@@ -456,6 +477,7 @@ def find_keywords_in_pdf(
         keywords: 关键字列表或字典（关键字->分数）
         output_file: 可选的输出文件路径（txt）
         excel_file: 可选的Excel输出文件路径（按重要性排序）
+        sort_by_importance: Excel是否按重要性排序，False时保持页码顺序
         auto_clean_noise: 是否自动检测并去除页眉页脚页码
         header_ratio: 页眉区域占比（默认15%）
         footer_ratio: 页脚区域占比（默认85%）
@@ -471,19 +493,16 @@ def find_keywords_in_pdf(
         keywords_list = keywords
         # 默认每字1分
         keywords_point = {k: 1 for k in keywords_list}
-    
-    if not keywords_list or len(keywords_list) == 0:
+
+    pattern, keyword_lookup, keywords_list = build_keywords_pattern(keywords_list)
+
+    if not keywords_list:
         return {
         'total_matches': 0,
         'by_page': {},
         'all_results':[],
         'noise_info': []
     }
-
-    # 构建合并的正则模式：(keyword1|keyword2|...)
-    # 使用 re.escape 确保特殊字符正确处理
-    escaped_keywords = [re.escape(kw) for kw in keywords_list]
-    pattern = re.compile('(' + '|'.join(escaped_keywords) + ')', re.IGNORECASE)
     
     # 输入值限制
     front_window = min(80, front_window)
@@ -495,7 +514,6 @@ def find_keywords_in_pdf(
     full_text, block_info, noise_info, page_prifix_sum = get_page_text_with_layout(
         pdf_path,
         keywords_pattern=pattern,
-        keywords=keywords_list,
         auto_clean_noise=auto_clean_noise,
         header_ratio=header_ratio,
         footer_ratio=footer_ratio,
@@ -510,7 +528,8 @@ def find_keywords_in_pdf(
         keywords_pattern= pattern,
         keywords = keywords_list, 
         context_chars = context_rich, 
-        front_window = front_window
+        front_window = front_window,
+        keyword_lookup=keyword_lookup
         )
 
     print(f"\n找到 {len(results)} 处匹配")
@@ -562,7 +581,7 @@ def find_keywords_in_pdf(
 
     # 导出Excel（按重要性排序）
     if excel_file:
-        export_to_excel(results, excel_file, pdf_path, keywords_point)
+        export_to_excel(results, excel_file, pdf_path, keywords_point, sort_by_importance=sort_by_importance)
         print(f"Excel已保存到: {excel_file}")
 
     # 导出高亮PDF
@@ -647,45 +666,246 @@ def map_match_to_blocks(
     return mappings
 
 
+def _normalize_fragment_text(text: str) -> str:
+    """使用与全文拼接相同的规则标准化片段文本。"""
+    text = text.replace('\n', '').replace('\r', '')
+    return WHITESPACE_PATTERN.sub(' ', text).strip()
+
+
+def _normalize_char_refs(char_refs: List[Dict]) -> Tuple[str, List[Dict]]:
+    """将 rawdict 字符流标准化为 block 文本，并保留每个标准化字符的坐标引用。"""
+    normalized_chars = []
+    normalized_refs = []
+
+    for ref in char_refs:
+        char = ref['char']
+        value = char.get('c', '')
+        if not value or value in '\r\n':
+            continue
+
+        if value.isspace():
+            if normalized_chars and normalized_chars[-1] != ' ':
+                normalized_chars.append(' ')
+                normalized_refs.append(ref)
+            continue
+
+        normalized_chars.append(value)
+        normalized_refs.append(ref)
+
+    while normalized_chars and normalized_chars[-1] == ' ':
+        normalized_chars.pop()
+        normalized_refs.pop()
+
+    return ''.join(normalized_chars), normalized_refs
+
+
+def _build_page_caches(page) -> Dict[int, Dict]:
+    """
+    为单页构建字符级高亮缓存。
+
+    rawdict 提供逐字符 bbox，可直接按 full_text 中的片段坐标回映射，
+    比逐片段调用 search_for 更快，也不会误标同一 block 内的重复关键字。
+    """
+    page_dict = page.get_text("rawdict")
+    block_cache = {}
+
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+
+        block_no = block.get("number")
+        char_refs = []
+        for line_idx, line in enumerate(block.get("lines", [])):
+            line_dir = tuple(line.get("dir", (1, 0)))
+            for span_idx, span in enumerate(line.get("spans", [])):
+                for char in span.get("chars", []):
+                    char_refs.append({
+                        'group': (line_idx, span_idx),
+                        'line_dir': line_dir,
+                        'span': span,
+                        'char': char
+                    })
+
+        normalized_text, normalized_refs = _normalize_char_refs(char_refs)
+        block_cache[block_no] = {
+            'bbox': block.get("bbox"),
+            'text': normalized_text,
+            'chars': normalized_refs
+        }
+
+    return block_cache
+
+
+def _locate_fragment_in_cache(block_text: str, cache_text: str,
+                              frag_start: int, frag_end: int) -> Tuple[int, int] | None:
+    """将 block_text 中的片段坐标转换到 rawdict 标准化字符缓存坐标。"""
+    sub_text = block_text[frag_start:frag_end]
+    if not sub_text:
+        return None
+
+    folded_sub = sub_text.casefold()
+    if (
+        0 <= frag_start < frag_end <= len(cache_text)
+        and cache_text[frag_start:frag_end].casefold() == folded_sub
+    ):
+        return frag_start, frag_end
+
+    normalized_sub = _normalize_fragment_text(sub_text)
+    if not normalized_sub:
+        return None
+
+    folded_sub = normalized_sub.casefold()
+    direct_end = frag_start + len(normalized_sub)
+    if (
+        0 <= frag_start < direct_end <= len(cache_text)
+        and cache_text[frag_start:direct_end].casefold() == folded_sub
+    ):
+        return frag_start, direct_end
+
+    folded_cache = cache_text.casefold()
+    candidates = []
+    search_start = 0
+    while True:
+        idx = folded_cache.find(folded_sub, search_start)
+        if idx == -1:
+            break
+        candidates.append(idx)
+        search_start = idx + 1
+
+    if not candidates:
+        return None
+
+    best_start = min(candidates, key=lambda idx: abs(idx - frag_start))
+    return best_start, best_start + len(normalized_sub)
+
+
+def _fallback_search_quads(page, sub_text: str, block_bbox) -> List:
+    """字符级定位失败时的保底 search_for，限制在 block bbox 内。"""
+    if not block_bbox:
+        return []
+
+    clip_rect = fitz.Rect(block_bbox)
+    rects = page.search_for(sub_text, clip=clip_rect)
+    if not rects:
+        return []
+
+    block_area = max(clip_rect.width * clip_rect.height, 1.0)
+    quads = []
+    for rect in rects:
+        rect_area = rect.width * rect.height
+        if rect_area / block_area < 0.6:
+            quads.append(rect.quad)
+    return quads
+
+
+def _quad_key(quad) -> Tuple[float, ...]:
+    """生成稳定的 quad 去重 key。"""
+    points = (quad.ul, quad.ur, quad.ll, quad.lr)
+    return tuple(round(value, 2) for point in points for value in (point.x, point.y))
+
+
+def _quads_from_char_refs(char_refs: List[Dict]) -> List:
+    """把连续字符引用转成适合 PyMuPDF 高亮的 Quad 列表。"""
+    start = 0
+    end = len(char_refs)
+    while start < end and char_refs[start]['char'].get('c', '').isspace():
+        start += 1
+    while end > start and char_refs[end - 1]['char'].get('c', '').isspace():
+        end -= 1
+
+    if start >= end:
+        return []
+
+    quads = []
+    current_group = None
+    current_refs = []
+
+    def flush_group():
+        if not current_refs:
+            return
+
+        line_dir = current_refs[0]['line_dir']
+        span = current_refs[0]['span']
+        chars = [ref['char'] for ref in current_refs]
+        try:
+            quads.append(fitz.recover_span_quad(line_dir, span, chars=chars))
+        except Exception:
+            x0 = min(char['bbox'][0] for char in chars)
+            y0 = min(char['bbox'][1] for char in chars)
+            x1 = max(char['bbox'][2] for char in chars)
+            y1 = max(char['bbox'][3] for char in chars)
+            quads.append(fitz.Rect(x0, y0, x1, y1).quad)
+
+    for ref in char_refs[start:end]:
+        group = ref['group']
+        if current_group is not None and group != current_group:
+            flush_group()
+            current_refs = []
+        current_group = group
+        current_refs.append(ref)
+
+    flush_group()
+    return quads
+
+
 def find_quads_in_block(page, block_no: int, block_text: str,
                         frag_start: int, frag_end: int,
-                        block_bbox, block_words) -> list:
+                        block_cache: Dict[int, Dict]) -> list:
     """
-    在指定page的指定block中定位文本片段，返回Quad列表用于高亮。
+    在指定 page 的指定 block 中定位文本片段，返回 Quad 列表用于高亮。
 
-    参数:
-        block_bbox: 该block的bbox [x0,y0,x1,y1]（外部预计算缓存）
-        block_words: 该block的words列表 [(x0,y0,x1,y1,"text",...)]（外部预计算缓存）
+    优先使用 rawdict 字符坐标精确定位；失败时再退回 block 内 search_for。
     """
     sub_text = block_text[frag_start:frag_end]
     if not sub_text.strip():
         return []
 
-    # 策略1: search_for + clip到block区域 → 精确且高效
-    if block_bbox:
-        clip_rect = fitz.Rect(block_bbox)
-        rects = page.search_for(sub_text, clip=clip_rect)
-        if rects:
-            return [r.quad for r in rects]
-
-    # 策略2: words级定位（处理block内跨行，或block_bbox缺失时）
-    if not block_words:
+    cache = block_cache.get(block_no)
+    if not cache:
         return []
 
-    word_text = ''.join(w[4] for w in block_words)
-    idx = word_text.find(sub_text)
-    if idx == -1:
-        return []
+    located = _locate_fragment_in_cache(block_text, cache['text'], frag_start, frag_end)
+    if located:
+        start, end = located
+        quads = _quads_from_char_refs(cache['chars'][start:end])
+        if quads:
+            return quads
 
-    quads = []
-    pos = 0
-    for w in block_words:
-        wlen = len(w[4])
-        w_end = pos + wlen
-        if w_end > idx and pos < idx + len(sub_text):
-            quads.append(fitz.Rect(w[:4]).quad)
-        pos = w_end
-    return quads
+    return _fallback_search_quads(page, sub_text, cache.get('bbox'))
+
+
+def _process_page_batch(pdf_path: str, page_items: List[Tuple[int, List[Tuple]]]) -> List[Tuple[int, List]]:
+    """在线程中处理一批页面；每个线程只打开一次文档，减少反复打开 PDF 的开销。"""
+    doc = fitz.open(pdf_path)
+    try:
+        results = []
+        for page_num, fragments in page_items:
+            page = doc[page_num - 1]
+            block_cache = _build_page_caches(page)
+
+            quads = []
+            seen_fragments = set()
+            seen_quads = set()
+            for block_no, block_text, frag_start, frag_end in fragments:
+                fragment_key = (block_no, frag_start, frag_end)
+                if fragment_key in seen_fragments:
+                    continue
+                seen_fragments.add(fragment_key)
+
+                for quad in find_quads_in_block(
+                    page, block_no, block_text, frag_start, frag_end, block_cache
+                ):
+                    quad_key = _quad_key(quad)
+                    if quad_key in seen_quads:
+                        continue
+                    seen_quads.add(quad_key)
+                    quads.append(quad)
+
+            results.append((page_num, quads))
+
+        return results
+    finally:
+        doc.close()
 
 
 def export_pdf_with_highlight(
@@ -698,8 +918,9 @@ def export_pdf_with_highlight(
     """
     导出带有高亮关键字的PDF文件，支持跨行和跨页关键字。
 
-    性能优化：get_text("dict") 和 get_text("words") 每页仅调用一次，
-    将block_bbox和block_words缓存后分发给各fragment复用。
+    多线程优化：
+    - Phase 1：多线程并行执行只读定位，每线程打开一次文档并处理一批页面
+    - Phase 2：主线程按页批量写入高亮标注，保存文档
 
     参数:
         pdf_path: 原始PDF文件路径
@@ -731,40 +952,45 @@ def export_pdf_with_highlight(
                 blk['frag_start'], blk['frag_end']
             ))
 
+    if not page_fragments:
+        print("没有可高亮的文本片段，跳过高亮PDF生成")
+        return
+
+    # ===== Phase 1: 多线程并行执行只读操作（quad定位）=====
+    page_items = sorted(page_fragments.items())
+    max_workers = min(os.cpu_count() or 4, len(page_items), 8)
+    all_page_quads = {}  # page_num -> [quad, ...]
+
+    if max_workers <= 1:
+        page_quad_items = _process_page_batch(pdf_path, page_items)
+        for page_num, quads in page_quad_items:
+            if quads:
+                all_page_quads[page_num] = quads
+    else:
+        chunks = [page_items[i::max_workers] for i in range(max_workers)]
+        chunks = [chunk for chunk in chunks if chunk]
+        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+            futures = [executor.submit(_process_page_batch, pdf_path, chunk) for chunk in chunks]
+            for future in as_completed(futures):
+                for page_num, quads in future.result():
+                    if quads:
+                        all_page_quads[page_num] = quads
+
+    # ===== Phase 2: 主线程串行应用高亮标注 =====
     doc = fitz.open(pdf_path)
     total_quads = 0
 
-    for page_num, fragments in page_fragments.items():
+    for page_num in sorted(all_page_quads):
+        quads = all_page_quads[page_num]
         page = doc[page_num - 1]
-
-        # === 每页一次性构建缓存（核心性能优化） ===
-        page_dict = page.get_text("dict")
-        block_bbox_cache = {}
-        for b in page_dict["blocks"]:
-            if b.get("type") == 0:
-                block_bbox_cache[b.get("number")] = b["bbox"]
-
-        page_words = page.get_text("words", sort=True)
-        block_words_cache = {}
-        for w in page_words:
-            bn = w[5]  # block_no
-            if bn not in block_words_cache:
-                block_words_cache[bn] = []
-            block_words_cache[bn].append(w)
-        # =============================================
-
-        seen = set()
-        for block_no, block_text, frag_start, frag_end in fragments:
-            key = (block_no, frag_start, frag_end)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            quads = find_quads_in_block(
-                page, block_no, block_text, frag_start, frag_end,
-                block_bbox_cache.get(block_no),
-                block_words_cache.get(block_no, [])
-            )
+        if not quads:
+            continue
+        try:
+            annot = page.add_highlight_annot(quads)
+            annot.set_colors(stroke=color)
+            annot.update()
+            total_quads += len(quads)
+        except Exception:
             for quad in quads:
                 annot = page.add_highlight_annot(quads=[quad])
                 annot.set_colors(stroke=color)
@@ -823,7 +1049,6 @@ def export_to_txt(
             for kw in keywords_list:
                 count = keyword_counts.get(kw, 0)
                 if count > 0:
-                    score = keyword_scores.get(kw, 0)
                     f.write(f"  - {kw}: 命中 {count} 次\n")
             # 跨页统计
             cross_page_count = sum(1 for r in results if r.get('is_cross_page', False))
@@ -861,8 +1086,17 @@ def export_to_txt(
         print(f"\n深度分析报告已保存到: {output_file}")
 
 
-def export_to_excel(results: List[Dict], excel_file: str, pdf_path: str, keywords_point: Dict[str, int]):
-    sorted_results = sorted(results, key=lambda x: x.get('score', 0), reverse=True)
+def export_to_excel(
+    results: List[Dict],
+    excel_file: str,
+    pdf_path: str,
+    keywords_point: Dict[str, int],
+    sort_by_importance: bool = True
+):
+    if sort_by_importance:
+        sorted_results = sorted(results, key=lambda x: x.get('score', 0), reverse=True)
+    else:
+        sorted_results = list(results)
 
     wb = Workbook()
     ws = wb.active

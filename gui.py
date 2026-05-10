@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import contextlib
 from pathlib import Path
 from typing import Dict, Optional
 import traceback
@@ -8,10 +9,10 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QCheckBox, QSlider, QFileDialog,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
-    QMessageBox, QDialog, QTextBrowser, QGroupBox
+    QMessageBox, QGroupBox
 )
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QIntValidator
 
 # 假设存在 pdf_keyword_finder 模块，若本地测试可注释掉或提供 mock
 try:
@@ -55,6 +56,7 @@ class SearchWorker(QThread):
     """搜索工作线程，避免阻塞UI"""
     search_finished = Signal(dict)
     search_error = Signal(str, str)
+    progress_message = Signal(str)
 
     def __init__(self, params: dict):
         super().__init__()
@@ -63,7 +65,9 @@ class SearchWorker(QThread):
 
     def run(self):
         try:
-            results = pdf_keyword_finder.find_keywords_in_pdf(**self.params)
+            stream = _WorkerOutputStream(self.progress_message)
+            with contextlib.redirect_stdout(stream):
+                results = pdf_keyword_finder.find_keywords_in_pdf(**self.params)
             if not self._cancel_flag:
                 self.search_finished.emit(results)
         except Exception as e:
@@ -73,6 +77,31 @@ class SearchWorker(QThread):
 
     def cancel(self):
         self._cancel_flag = True
+
+
+class _WorkerOutputStream:
+    """把后台任务的 print 输出转为 Qt 信号，用于更新界面状态。"""
+
+    def __init__(self, signal: Signal):
+        self.signal = signal
+        self._buffer = ""
+
+    def write(self, text: str):
+        if not text:
+            return
+
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.strip()
+            if line:
+                self.signal.emit(line)
+
+    def flush(self):
+        line = self._buffer.strip()
+        if line:
+            self.signal.emit(line)
+            self._buffer = ""
 
 
 class PDFKeywordFinderApp(QMainWindow):
@@ -91,8 +120,10 @@ class PDFKeywordFinderApp(QMainWindow):
         self.search_worker: Optional[SearchWorker] = None
         self.is_searching = False
         self._last_noise_info = []
+        self._last_output_dir = ""
 
         self._init_ui()
+        self._sync_output_option_state()
 
     def _init_ui(self):
         """初始化界面组件"""
@@ -183,6 +214,7 @@ class PDFKeywordFinderApp(QMainWindow):
         self.score_input = QLineEdit("1")
         self.score_input.setPlaceholderText("分数")
         self.score_input.setFixedWidth(60)
+        self.score_input.setValidator(QIntValidator(1, 9999, self))
         self.score_input.returnPressed.connect(self._add_keyword)
         add_layout.addWidget(self.score_input)
 
@@ -244,6 +276,7 @@ class PDFKeywordFinderApp(QMainWindow):
         front_layout.addWidget(QLabel("前窗口字数:"))
         self.front_entry = QLineEdit("0")
         self.front_entry.setFixedWidth(80)
+        self.front_entry.setValidator(QIntValidator(0, 80, self))
         front_layout.addWidget(self.front_entry)
         front_layout.addStretch()
         context_layout.addLayout(front_layout)
@@ -259,6 +292,7 @@ class PDFKeywordFinderApp(QMainWindow):
         output_layout.addWidget(self.txt_check)
         self.excel_check = QCheckBox("输出 Excel 文件")
         self.excel_check.setChecked(True)
+        self.excel_check.toggled.connect(self._sync_output_option_state)
         output_layout.addWidget(self.excel_check)
         self.sort_check = QCheckBox("按重要性排序")
         self.sort_check.setChecked(True)
@@ -282,7 +316,7 @@ class PDFKeywordFinderApp(QMainWindow):
         h_layout = QHBoxLayout()
         self.header_slider = QSlider(Qt.Horizontal)
         self.header_slider.setRange(0, 20)
-        self.header_slider.setValue(10)
+        self.header_slider.setValue(15)
         self.header_slider.setEnabled(False)
         h_layout.addWidget(self.header_slider)
         self.header_value_label = QLabel("15%")
@@ -295,7 +329,7 @@ class PDFKeywordFinderApp(QMainWindow):
         f_layout = QHBoxLayout()
         self.footer_slider = QSlider(Qt.Horizontal)
         self.footer_slider.setRange(80, 100)
-        self.footer_slider.setValue(90)
+        self.footer_slider.setValue(85)
         self.footer_slider.setEnabled(False)
         f_layout.addWidget(self.footer_slider)
         self.footer_value_label = QLabel("85%")
@@ -308,10 +342,10 @@ class PDFKeywordFinderApp(QMainWindow):
         r_layout = QHBoxLayout()
         self.threshold_slider = QSlider(Qt.Horizontal)
         self.threshold_slider.setRange(50, 95)
-        self.threshold_slider.setValue(30)
+        self.threshold_slider.setValue(50)
         self.threshold_slider.setEnabled(False)
         r_layout.addWidget(self.threshold_slider)
-        self.threshold_value_label = QLabel("30%")
+        self.threshold_value_label = QLabel("50%")
         self.threshold_slider.valueChanged.connect(lambda v: self.threshold_value_label.setText(f"{v}%"))
         r_layout.addWidget(self.threshold_value_label)
         noise_layout.addLayout(r_layout)
@@ -371,6 +405,7 @@ class PDFKeywordFinderApp(QMainWindow):
         
         self.noise_check.setEnabled(state)
         self._toggle_noise_params()
+        self._sync_output_option_state()
 
     def _toggle_noise_params(self):
         """根据噪声检测开关启用/禁用参数控件"""
@@ -378,6 +413,10 @@ class PDFKeywordFinderApp(QMainWindow):
         self.header_slider.setEnabled(enabled)
         self.footer_slider.setEnabled(enabled)
         self.threshold_slider.setEnabled(enabled)
+
+    def _sync_output_option_state(self):
+        """保持输出选项之间的状态一致。"""
+        self.sort_check.setEnabled(self.excel_check.isChecked() and self.excel_check.isEnabled())
 
     # ==================== 文件操作 ====================
 
@@ -397,7 +436,7 @@ class PDFKeywordFinderApp(QMainWindow):
 
     def _open_output_dir(self):
         """打开输出目录"""
-        output_dir = self.output_entry.text()
+        output_dir = self.output_entry.text().strip() or self._last_output_dir
         if not output_dir:
             pdf_path = self.pdf_entry.text()
             if pdf_path and os.path.exists(pdf_path):
@@ -406,13 +445,7 @@ class PDFKeywordFinderApp(QMainWindow):
                 output_dir = ""
 
         if output_dir and os.path.exists(output_dir):
-            # 跨平台打开目录
-            if sys.platform == "win32":
-                os.startfile(output_dir)
-            elif sys.platform == "darwin":
-                os.system(f'open "{output_dir}"')
-            else:
-                os.system(f'xdg-open "{output_dir}"')
+            QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
         else:
             QMessageBox.warning(self, "提示", "输出目录不存在，请先执行搜索或手动指定目录")
 
@@ -425,13 +458,7 @@ class PDFKeywordFinderApp(QMainWindow):
             QMessageBox.warning(self, "提示", "请输入关键字")
             return
 
-        try:
-            score = int(self.score_input.text())
-        except ValueError:
-            score = 1
-
-        if score < 1:
-            score = 1
+        score = self._read_int(self.score_input, default=1, min_value=1, max_value=9999)
 
         if keyword in self.keywords:
             QMessageBox.warning(self, "提示", f"关键字 '{keyword}' 已存在")
@@ -484,7 +511,7 @@ class PDFKeywordFinderApp(QMainWindow):
                 "keywords": self.keywords,
                 "settings": {
                     "context_chars": self.context_slider.value(),
-                    "front_window": int(self.front_entry.text() or 0),
+                    "front_window": self._read_int(self.front_entry, default=0, min_value=0, max_value=80),
                     "output_txt": self.txt_check.isChecked(),
                     "output_excel": self.excel_check.isChecked(),
                     "output_highlight": self.highlight_check.isChecked(),
@@ -531,6 +558,16 @@ class PDFKeywordFinderApp(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"加载配置失败:\n{str(e)}")
 
+    def _read_int(self, line_edit: QLineEdit, default: int, min_value: int, max_value: int) -> int:
+        """读取整数输入，并限制在指定范围内。"""
+        try:
+            value = int(line_edit.text().strip() or default)
+        except ValueError:
+            value = default
+        value = max(min_value, min(max_value, value))
+        line_edit.setText(str(value))
+        return value
+
     # ==================== 搜索操作 ====================
 
     def _start_search(self):
@@ -548,25 +585,30 @@ class PDFKeywordFinderApp(QMainWindow):
             QMessageBox.warning(self, "提示", "请添加至少一个关键字")
             return
 
-        if not self.txt_check.isChecked() and not self.excel_check.isChecked():
+        if not (self.txt_check.isChecked() or self.excel_check.isChecked() or self.highlight_check.isChecked()):
             QMessageBox.warning(self, "提示", "请至少选择一种输出格式")
             return
 
         # 准备输出路径
         pdf_name = Path(pdf_path).stem
-        output_dir = self.output_entry.text() or str(Path(pdf_path).parent)
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = self.output_entry.text().strip() or str(Path(pdf_path).parent)
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            QMessageBox.critical(self, "错误", f"无法创建输出目录:\n{e}")
+            return
 
         output_file = os.path.join(output_dir, f"{pdf_name}_搜索日志.txt") if self.txt_check.isChecked() else None
         excel_file = os.path.join(output_dir, f"{pdf_name}_关键字分析表.xlsx") if self.excel_check.isChecked() else None
         highlight_pdf = os.path.join(output_dir, f"{pdf_name}_高亮版.pdf") if self.highlight_check.isChecked() else None
+        self._last_output_dir = output_dir
 
         # 更新UI状态并启动进度条加载动画
         self.is_searching = True
         self._set_ui_state(True)
         self.progress_bar.setRange(0, 0)  # 切换为不确定进度条(滚动动画)
         self.progress_label.setText("正在搜索...")
-        front_window = min(80, int(self.front_entry.text() or 0))
+        front_window = self._read_int(self.front_entry, default=0, min_value=0, max_value=80)
 
         # 实例化并启动工作线程
         self.search_worker = SearchWorker({
@@ -580,10 +622,13 @@ class PDFKeywordFinderApp(QMainWindow):
             "auto_clean_noise": self.noise_check.isChecked(),
             "header_ratio": self.header_slider.value() / 100.0,
             "footer_ratio": self.footer_slider.value() / 100.0,
-            "repeat_threshold": self.threshold_slider.value() / 100.0
+            "repeat_threshold": self.threshold_slider.value() / 100.0,
+            "sort_by_importance": self.sort_check.isChecked()
         })
         self.search_worker.search_finished.connect(self._on_search_finished)
         self.search_worker.search_error.connect(self._on_search_error)
+        self.search_worker.progress_message.connect(self._on_search_progress)
+        self.search_worker.finished.connect(self._on_worker_stopped)
         self.search_worker.start()
 
     def _cancel_search(self):
@@ -601,8 +646,18 @@ class PDFKeywordFinderApp(QMainWindow):
         self.progress_bar.setValue(100)
 
         total_matches = results.get('total_matches', 0)
-        message = f"搜索完成，找到 {total_matches} 处匹配，请前往输出目录查看文件。"
+        noise_count = len(results.get('noise_info', []) or [])
+        message = f"搜索完成，找到 {total_matches} 处匹配"
+        if noise_count:
+            message += f"，过滤 {noise_count} 个噪声块"
+        message += "。"
         self.progress_label.setText(message)
+
+    def _on_search_progress(self, message: str):
+        """显示后台搜索阶段信息。"""
+        message = message.strip()
+        if message and self.is_searching:
+            self.progress_label.setText(message)
 
     def _on_search_error(self, error_msg: str, error_detail: str):
         """搜索失败回调"""
@@ -624,6 +679,20 @@ class PDFKeywordFinderApp(QMainWindow):
             print(f"写入错误日志失败: {e}")
         # -----------------------------------------
         QMessageBox.critical(self, "错误", f"搜索失败:\n{error_msg}")
+
+    def _on_worker_stopped(self):
+        """工作线程自然结束后的收尾；兼容取消时不发 search_finished 的情况。"""
+        worker = self.search_worker
+        if worker and worker._cancel_flag and self.is_searching:
+            self.is_searching = False
+            self._set_ui_state(False)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("已取消")
+
+        if worker:
+            worker.deleteLater()
+        self.search_worker = None
 
 
 
